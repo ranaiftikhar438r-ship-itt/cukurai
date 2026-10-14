@@ -289,6 +289,11 @@ def initialize_database() -> None:
         logger.warning("Database initialization deferred; database-backed requests will report errors.")
 
 
+@app.get("/")
+def root() -> dict[str, str]:
+    return {"message": "Welcome to Cukur AI", "status": "ok"}
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     _ensure_schema()

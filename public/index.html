@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#050a12">
+    <meta name="description" content="Cukur AI — your secure, always-ready virtual assistant.">
+    <title>Cukur AI — Secure Assistant</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              void: "#050a12",
+              panel: "#0a1320",
+              cyan: "#46e7ff",
+              muted: "#7b91a8"
+            },
+            boxShadow: {
+              glow: "0 0 26px rgba(70, 231, 255, .15)"
+            }
+          }
+        }
+      };
+    </script>
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        background-color: #050a12;
+        background-image:
+          radial-gradient(ellipse at 50% -20%, rgba(12, 82, 120, .23), transparent 55%),
+          linear-gradient(rgba(70, 231, 255, .025) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(70, 231, 255, .025) 1px, transparent 1px);
+        background-size: auto, 36px 36px, 36px 36px;
+      }
+      .glass { background: rgba(10, 19, 32, .84); backdrop-filter: blur(18px); }
+      .scrollbar::-webkit-scrollbar { width: 6px; }
+      .scrollbar::-webkit-scrollbar-thumb { background: #19354b; border-radius: 999px; }
+      .scanline { background: linear-gradient(90deg, transparent, #46e7ff, transparent); }
+      .pulse-ring { animation: pulse-ring 2s ease-out infinite; }
+      @keyframes pulse-ring {
+        0% { box-shadow: 0 0 0 0 rgba(70, 231, 255, .34); }
+        70% { box-shadow: 0 0 0 10px rgba(70, 231, 255, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(70, 231, 255, 0); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
+      }
+    </style>
+  </head>
+  <body class="min-h-screen text-slate-100 antialiased">
+    <main class="mx-auto flex min-h-screen max-w-7xl flex-col px-4 py-5 sm:px-7 lg:px-10">
+      <header class="flex items-center justify-between border-b border-cyan/10 pb-5">
+        <a class="flex items-center gap-3" href="/" aria-label="Cukur AI home">
+          <span class="grid h-11 w-11 place-items-center rounded-xl border border-cyan/30 bg-cyan/5 text-cyan shadow-glow">
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" class="h-6 w-6">
+              <path d="M12 2.8 20 7v10l-8 4.2L4 17V7l8-4.2Z" stroke="currentColor" stroke-width="1.4"/>
+              <path d="m8 12 2.4 2.4L16.5 8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </span>
+          <span>
+            <span class="block text-sm font-semibold tracking-[.28em] text-white">CUKUR <span class="text-cyan">AI</span></span>
+            <span class="mt-1 block text-[10px] uppercase tracking-[.23em] text-muted">Secure assistant interface</span>
+          </span>
+        </a>
+        <div class="flex items-center gap-2 rounded-full border border-emerald-400/20 bg-emerald-400/5 px-3 py-2 text-xs text-emerald-300">
+          <span id="system-dot" class="h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_9px_#34d399]"></span>
+          <span id="system-label">System ready</span>
+        </div>
+      </header>
+
+      <section class="grid flex-1 gap-5 py-7 lg:grid-cols-[minmax(0,1fr)_290px]">
+        <div class="glass flex min-h-[68vh] flex-col overflow-hidden rounded-2xl border border-cyan/10 shadow-glow">
+          <div class="flex items-center justify-between border-b border-white/5 px-5 py-4">
+            <div>
+              <h1 class="text-sm font-medium tracking-wide text-white">Command channel</h1>
+              <p class="mt-1 text-xs text-muted">Private session · encrypted transport</p>
+            </div>
+            <div class="flex items-center gap-2 text-[10px] uppercase tracking-[.18em] text-cyan/80">
+              <span class="relative flex h-2.5 w-2.5 items-center justify-center">
+                <span id="voice-pulse" class="absolute h-full w-full rounded-full bg-cyan/40"></span>
+                <span id="voice-dot" class="relative h-1.5 w-1.5 rounded-full bg-cyan"></span>
+              </span>
+              <span id="voice-status">Standby</span>
+            </div>
+          </div>
+
+          <div id="log" class="scrollbar flex-1 space-y-5 overflow-y-auto px-4 py-6 sm:px-6" aria-live="polite" aria-relevant="additions">
+            <div class="flex gap-3">
+              <span class="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-cyan/20 bg-cyan/5 text-[10px] font-semibold text-cyan">CA</span>
+              <div class="max-w-[85%]">
+                <p class="mb-1 text-[10px] uppercase tracking-[.18em] text-cyan/70">Cukur AI <span class="ml-2 text-slate-600">SYSTEM</span></p>
+                <p class="rounded-2xl rounded-tl-sm border border-white/5 bg-white/[.035] px-4 py-3 text-sm leading-6 text-slate-300">Connection established. I’m ready when you are.</p>
+              </div>
+            </div>
+          </div>
+
+          <form id="chat-form" class="border-t border-white/5 p-4 sm:p-5">
+            <label class="sr-only" for="message-input">Message Cukur AI</label>
+            <div class="flex items-end gap-2 rounded-xl border border-white/10 bg-black/20 p-2 transition focus-within:border-cyan/40 focus-within:shadow-[0_0_0_3px_rgba(70,231,255,.06)]">
+              <textarea id="message-input" rows="1" maxlength="8000" required placeholder="Send a secure message…" class="max-h-36 min-h-11 flex-1 resize-y bg-transparent px-3 py-3 text-sm text-white outline-none placeholder:text-slate-600" aria-describedby="composer-hint"></textarea>
+              <button id="voice-button" type="button" class="grid h-11 w-11 shrink-0 place-items-center rounded-lg text-slate-400 transition hover:bg-white/5 hover:text-cyan focus:outline-none focus:ring-2 focus:ring-cyan/50" aria-label="Start voice input" title="Voice input (if supported)">
+                <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" class="h-5 w-5"><rect x="9" y="3" width="6" height="12" rx="3" stroke="currentColor" stroke-width="1.5"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3m-3 0h6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+              </button>
+              <button id="send-button" type="submit" class="grid h-11 w-11 shrink-0 place-items-center rounded-lg bg-cyan text-void transition hover:bg-white focus:outline-none focus:ring-2 focus:ring-cyan/60 disabled:cursor-not-allowed disabled:opacity-40" aria-label="Send message">
+                <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" class="h-5 w-5"><path d="M4 12 20 4l-5.5 16-2.8-6.7L4 12Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="m11.7 13.3 4.1-4.1" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+              </button>
+            </div>
+            <p id="composer-hint" class="mt-2 px-1 text-[10px] text-slate-600">Enter to send · Shift+Enter for a new line</p>
+          </form>
+        </div>
+
+        <aside class="space-y-4">
+          <section class="glass rounded-2xl border border-cyan/10 p-5">
+            <div class="flex items-center justify-between">
+              <h2 class="text-xs font-semibold uppercase tracking-[.18em] text-slate-300">Security clearance</h2>
+              <span id="mode-badge" class="rounded-full border border-slate-600/50 px-2.5 py-1 text-[9px] uppercase tracking-wider text-slate-400">Standard</span>
+            </div>
+            <div class="my-5 flex items-center justify-center">
+              <div id="core-ring" class="grid h-24 w-24 place-items-center rounded-full border border-cyan/20 bg-cyan/[.04]">
+                <div class="grid h-16 w-16 place-items-center rounded-full border border-cyan/30 bg-cyan/[.07] text-cyan">
+                  <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" class="h-7 w-7"><path d="M7 10V7a5 5 0 0 1 10 0v3m-11 0h12v10H6V10Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="12" cy="15" r="1" fill="currentColor"/></svg>
+                </div>
+              </div>
+            </div>
+            <p id="mode-description" class="text-center text-xs leading-5 text-muted">Standard assistant access is active. Restricted requests require authorization.</p>
+            <button id="unlock-button" type="button" class="mt-5 w-full rounded-lg border border-cyan/25 bg-cyan/5 px-4 py-2.5 text-xs font-medium tracking-wide text-cyan transition hover:border-cyan/50 hover:bg-cyan/10 focus:outline-none focus:ring-2 focus:ring-cyan/40">Authenticate developer mode</button>
+          </section>
+
+          <section class="glass rounded-2xl border border-white/5 p-5">
+            <h2 class="text-[10px] font-semibold uppercase tracking-[.2em] text-slate-500">Session telemetry</h2>
+            <dl class="mt-4 space-y-3 text-xs">
+              <div class="flex justify-between gap-3"><dt class="text-slate-500">Channel</dt><dd class="font-mono text-slate-300">TLS / API</dd></div>
+              <div class="flex justify-between gap-3"><dt class="text-slate-500">Session</dt><dd id="session-display" class="max-w-36 truncate font-mono text-cyan/70">Starting…</dd></div>
+              <div class="flex justify-between gap-3"><dt class="text-slate-500">Assistant</dt><dd id="provider-status" class="text-slate-300">Connecting…</dd></div>
+            </dl>
+          </section>
+          <p class="px-2 text-[10px] leading-5 text-slate-600">Developer Mode changes authorization only. The assistant does not execute system commands or access infrastructure.</p>
+        </aside>
+      </section>
+      <footer class="flex items-center justify-between border-t border-white/5 pt-4 text-[10px] text-slate-600">
+        <span>CUKUR AI <span class="text-slate-700">/</span> SECURE INTERFACE</span>
+        <span>Session data stored in Neon</span>
+      </footer>
+    </main>
+
+    <div id="auth-modal" class="fixed inset-0 z-50 hidden items-center justify-center bg-black/75 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="auth-title" aria-describedby="auth-description">
+      <div class="glass w-full max-w-md rounded-2xl border border-cyan/25 p-6 shadow-[0_0_60px_rgba(0,0,0,.6)]">
+        <div class="mb-5 flex items-start justify-between">
+          <div>
+            <p class="text-[10px] uppercase tracking-[.25em] text-cyan/70">Restricted access</p>
+            <h2 id="auth-title" class="mt-2 text-lg font-medium text-white">Developer authentication</h2>
+          </div>
+          <button id="close-modal" type="button" class="rounded-lg p-2 text-slate-500 hover:bg-white/5 hover:text-white focus:outline-none focus:ring-2 focus:ring-cyan/40" aria-label="Close authentication">
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" class="h-5 w-5"><path d="m6 6 12 12M18 6 6 18" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          </button>
+        </div>
+        <p id="auth-description" class="mb-5 text-sm leading-6 text-muted">This request requires an elevated session. Enter your developer access code to authorize this session.</p>
+        <form id="auth-form">
+          <label for="access-code" class="mb-2 block text-xs text-slate-400">Access code</label>
+          <input id="access-code" name="code" type="password" required autocomplete="current-password" maxlength="256" class="w-full rounded-lg border border-white/10 bg-black/30 px-4 py-3 text-sm text-white outline-none placeholder:text-slate-600 focus:border-cyan/40 focus:ring-2 focus:ring-cyan/10" placeholder="Enter code">
+          <p id="auth-error" class="mt-2 min-h-5 text-xs text-rose-300" role="alert"></p>
+          <button id="auth-submit" type="submit" class="mt-3 w-full rounded-lg bg-cyan px-4 py-3 text-xs font-semibold uppercase tracking-[.15em] text-void transition hover:bg-white focus:outline-none focus:ring-2 focus:ring-cyan/50 disabled:opacity-50">Verify &amp; authorize</button>
+        </form>
+        <p class="mt-4 text-center text-[10px] text-slate-600">Authorization is verified by the server and saved for this session.</p>
+      </div>
+    </div>
+
+    <script>
+      (() => {
+        "use strict";
+
+        const SESSION_STORAGE_KEY = "cukur-ai-session-id";
+        const sessionId = getSessionId();
+        const elements = {
+          authError: document.getElementById("auth-error"),
+          authForm: document.getElementById("auth-form"),
+          authModal: document.getElementById("auth-modal"),
+          authSubmit: document.getElementById("auth-submit"),
+          chatForm: document.getElementById("chat-form"),
+          closeModal: document.getElementById("close-modal"),
+          coreRing: document.getElementById("core-ring"),
+          input: document.getElementById("message-input"),
+          log: document.getElementById("log"),
+          modeBadge: document.getElementById("mode-badge"),
+          modeDescription: document.getElementById("mode-description"),
+          providerStatus: document.getElementById("provider-status"),
+          sendButton: document.getElementById("send-button"),
+          sessionDisplay: document.getElementById("session-display"),
+          systemDot: document.getElementById("system-dot"),
+          systemLabel: document.getElementById("system-label"),
+          unlockButton: document.getElementById("unlock-button"),
+          voiceButton: document.getElementById("voice-button"),
+          voiceDot: document.getElementById("voice-dot"),
+          voicePulse: document.getElementById("voice-pulse"),
+          voiceStatus: document.getElementById("voice-status")
+        };
+        let developerModeActive = false;
+
+        function getSessionId() {
+          try {
+            let id = localStorage.getItem(SESSION_STORAGE_KEY);
+            if (!id) {
+              id = typeof crypto.randomUUID === "function"
+                ? crypto.randomUUID()
+                : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+              localStorage.setItem(SESSION_STORAGE_KEY, id);
+            }
+            return id;
+          } catch {
+            return typeof crypto.randomUUID === "function"
+              ? crypto.randomUUID()
+              : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+          }
+        }
+
+        function setDeveloperMode(active) {
+          developerModeActive = active;
+          elements.modeBadge.textContent = active ? "Developer" : "Standard";
+          elements.modeBadge.className = active
+            ? "rounded-full border border-cyan/30 bg-cyan/10 px-2.5 py-1 text-[9px] uppercase tracking-wider text-cyan"
+            : "rounded-full border border-slate-600/50 px-2.5 py-1 text-[9px] uppercase tracking-wider text-slate-400";
+          elements.modeDescription.textContent = active
+            ? "Developer authorization is active for this server-verified session."
+            : "Standard assistant access is active. Restricted requests require authorization.";
+          elements.unlockButton.classList.toggle("hidden", active);
+          elements.coreRing.classList.toggle("pulse-ring", active);
+        }
+
+        function setVoiceStatus(status, listening = false) {
+          elements.voiceStatus.textContent = status;
+          elements.voicePulse.classList.toggle("pulse-ring", listening);
+          elements.voiceDot.classList.toggle("bg-cyan", !listening);
+          elements.voiceDot.classList.toggle("bg-rose-400", listening);
+        }
+
+        function appendMessage(role, text, kind = "") {
+          const wrapper = document.createElement("div");
+          wrapper.className = role === "user" ? "flex justify-end gap-3" : "flex gap-3";
+          const badge = document.createElement("span");
+          badge.className = role === "user"
+            ? "grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-white/10 bg-white/5 text-[10px] font-semibold text-slate-300"
+            : "grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-cyan/20 bg-cyan/5 text-[10px] font-semibold text-cyan";
+          badge.textContent = role === "user" ? "YOU" : "CA";
+          const content = document.createElement("div");
+          content.className = "max-w-[85%]";
+          const label = document.createElement("p");
+          label.className = role === "user"
+            ? "mb-1 text-right text-[10px] uppercase tracking-[.18em] text-slate-500"
+            : "mb-1 text-[10px] uppercase tracking-[.18em] text-cyan/70";
+          label.textContent = role === "user" ? "You" : `Cukur AI${kind ? ` · ${kind}` : ""}`;
+          const message = document.createElement("p");
+          message.className = role === "user"
+            ? "whitespace-pre-wrap rounded-2xl rounded-tr-sm border border-cyan/15 bg-cyan/[.08] px-4 py-3 text-sm leading-6 text-slate-200"
+            : "whitespace-pre-wrap rounded-2xl rounded-tl-sm border border-white/5 bg-white/[.035] px-4 py-3 text-sm leading-6 text-slate-300";
+          message.textContent = text;
+          content.append(label, message);
+          if (role === "user") wrapper.append(content, badge);
+          else wrapper.append(badge, content);
+          elements.log.append(wrapper);
+          elements.log.scrollTop = elements.log.scrollHeight;
+        }
+
+        async function apiRequest(path, options = {}) {
+          const response = await fetch(path, {
+            ...options,
+            headers: { "Content-Type": "application/json", ...(options.headers || {}) }
+          });
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            throw new Error(payload.detail || `Request failed (${response.status}).`);
+          }
+          return payload;
+        }
+
+        function setBusy(busy) {
+          elements.sendButton.disabled = busy;
+          elements.input.disabled = busy;
+          if (busy) {
+            elements.systemLabel.textContent = "Processing";
+            elements.systemDot.classList.remove("bg-emerald-400", "bg-rose-400");
+            elements.systemDot.classList.add("bg-cyan");
+          } else {
+            if (elements.systemLabel.textContent === "Processing") {
+              elements.systemLabel.textContent = "System ready";
+            }
+            if (elements.systemDot.classList.contains("bg-cyan")) {
+              elements.systemDot.classList.replace("bg-cyan", "bg-emerald-400");
+            }
+          }
+          setVoiceStatus(busy ? "Processing" : "Standby", busy);
+        }
+
+        function openAuthModal(errorText = "") {
+          elements.authError.textContent = errorText;
+          elements.authModal.classList.remove("hidden");
+          elements.authModal.classList.add("flex");
+          elements.authForm.elements.namedItem("code").focus();
+        }
+
+        function closeAuthModal() {
+          elements.authModal.classList.add("hidden");
+          elements.authModal.classList.remove("flex");
+          elements.authError.textContent = "";
+          elements.authForm.reset();
+          (developerModeActive ? elements.input : elements.unlockButton).focus();
+        }
+
+        elements.sessionDisplay.textContent = sessionId.slice(0, 8);
+
+        elements.chatForm.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          const message = elements.input.value.trim();
+          if (!message || elements.sendButton.disabled) return;
+          appendMessage("user", message);
+          elements.input.value = "";
+          setBusy(true);
+          try {
+            const result = await apiRequest("/api/chat", {
+              method: "POST",
+              body: JSON.stringify({
+                session_id: sessionId,
+                message,
+                developer_mode: developerModeActive
+              })
+            });
+            setDeveloperMode(Boolean(result.developer_mode_active));
+            appendMessage("assistant", result.reply, result.auth_required ? "AUTH REQUIRED" : "");
+            if (result.auth_required) openAuthModal();
+          } catch (error) {
+            appendMessage("assistant", error.message || "The request failed. Please try again.", "CONNECTION ERROR");
+            elements.systemLabel.textContent = "Connection issue";
+            elements.systemDot.classList.remove("bg-emerald-400", "bg-cyan");
+            elements.systemDot.classList.add("bg-rose-400");
+          } finally {
+            setBusy(false);
+          }
+        });
+
+        elements.input.addEventListener("keydown", (event) => {
+          if (event.key === "Enter" && !event.shiftKey) {
+            event.preventDefault();
+            elements.chatForm.requestSubmit();
+          }
+        });
+
+        elements.unlockButton.addEventListener("click", () => openAuthModal());
+        elements.closeModal.addEventListener("click", closeAuthModal);
+        elements.authModal.addEventListener("click", (event) => {
+          if (event.target === elements.authModal) closeAuthModal();
+        });
+        document.addEventListener("keydown", (event) => {
+          if (event.key === "Escape" && !elements.authModal.classList.contains("hidden")) closeAuthModal();
+        });
+
+        elements.authForm.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          const code = elements.authForm.elements.namedItem("code").value;
+          elements.authSubmit.disabled = true;
+          elements.authError.textContent = "";
+          try {
+            const result = await apiRequest("/api/verify", {
+              method: "POST",
+              body: JSON.stringify({ session_id: sessionId, code })
+            });
+            setDeveloperMode(Boolean(result.developer_mode_active));
+            closeAuthModal();
+            appendMessage("assistant", "Developer authorization verified for this session.");
+          } catch (error) {
+            elements.authError.textContent = error.message || "Authentication failed.";
+          } finally {
+            elements.authSubmit.disabled = false;
+          }
+        });
+
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (SpeechRecognition) {
+          const recognition = new SpeechRecognition();
+          recognition.lang = navigator.language || "en-US";
+          recognition.interimResults = false;
+          recognition.maxAlternatives = 1;
+          elements.voiceButton.addEventListener("click", () => {
+            setVoiceStatus("Listening", true);
+            try {
+              recognition.start();
+            } catch {
+              setVoiceStatus("Standby");
+            }
+          });
+          recognition.addEventListener("result", (event) => {
+            elements.input.value = `${elements.input.value}${elements.input.value ? " " : ""}${event.results[0][0].transcript}`;
+            elements.input.focus();
+          });
+          recognition.addEventListener("error", () => setVoiceStatus("Voice unavailable"));
+          recognition.addEventListener("end", () => setVoiceStatus("Standby"));
+        } else {
+          elements.voiceButton.disabled = true;
+          elements.voiceButton.title = "Voice input is not supported by this browser.";
+          elements.voiceButton.classList.add("cursor-not-allowed", "opacity-40");
+        }
+
+        apiRequest(`/api/session/${encodeURIComponent(sessionId)}`)
+          .then((result) => {
+            setDeveloperMode(Boolean(result.developer_mode_active));
+            elements.providerStatus.textContent = "API online";
+          })
+          .catch(() => {
+            elements.providerStatus.textContent = "API unavailable";
+            elements.systemLabel.textContent = "Backend unavailable";
+            elements.systemDot.classList.remove("bg-emerald-400");
+            elements.systemDot.classList.add("bg-rose-400");
+          });
+      })();
+    </script>
+  </body>
+</html>

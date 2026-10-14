@@ -1,4 +1,5 @@
 fastapi
+google-genai==2.30.1
 mangum
 psycopg2-binary
 requests

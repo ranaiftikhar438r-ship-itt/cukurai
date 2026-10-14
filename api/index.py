@@ -47,6 +47,14 @@ _pool_lock = threading.Lock()
 _schema_ready = False
 _schema_lock = threading.Lock()
 
+class ImageContext(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    media_type: str = Field(pattern=r"^image/(?:png|jpeg|webp|gif)$")
+    data: str = Field(min_length=1, max_length=8_000_000)
+    description: str | None = Field(default=None, max_length=1000)
+
+
 class ChatRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -54,14 +62,6 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=8000)
     developer_mode: bool = False
     images: list[ImageContext] = Field(default_factory=list, max_length=4)
-
-
-class ImageContext(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-
-    media_type: str = Field(pattern=r"^image/(?:png|jpeg|webp|gif)$")
-    data: str = Field(min_length=1, max_length=8_000_000)
-    description: str | None = Field(default=None, max_length=1000)
 
 
 class VerifyRequest(BaseModel):
@@ -502,16 +502,36 @@ def _call_gemini(
     payload["tools"] = [{"google_search": {}}]
 
     try:
+        endpoint = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{settings.gemini_model}:generateContent"
+        )
+        headers = {"x-goog-api-key": api_key}
         response = requests.post(
-            (
-                "https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{settings.gemini_model}:generateContent"
-            ),
-            headers={"x-goog-api-key": api_key},
+            endpoint,
+            headers=headers,
             json=payload,
             timeout=(5, 60),
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            error_detail = response.text.lower()
+            is_search_tool_error = response.status_code == 400 and any(
+                marker in error_detail
+                for marker in ("google_search", "google search", "grounding", "tool")
+            )
+            if not is_search_tool_error:
+                raise
+            logger.warning("Gemini rejected Google Search grounding; retrying without it.")
+            payload.pop("tools", None)
+            response = requests.post(
+                endpoint,
+                headers=headers,
+                json=payload,
+                timeout=(5, 60),
+            )
+            response.raise_for_status()
         response_body = response.json()
         if not isinstance(response_body, dict):
             raise ValueError("Gemini response must be a JSON object.")

@@ -112,6 +112,9 @@
               <button id="voice-button" type="button" class="grid h-11 w-11 shrink-0 place-items-center rounded-lg text-slate-400 transition hover:bg-white/5 hover:text-cyan focus:outline-none focus:ring-2 focus:ring-cyan/50" aria-label="Start voice input" title="Voice input (if supported)">
                 <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" class="h-5 w-5"><rect x="9" y="3" width="6" height="12" rx="3" stroke="currentColor" stroke-width="1.5"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3m-3 0h6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
               </button>
+              <button id="voice-output-button" type="button" aria-pressed="false" class="grid h-11 w-11 shrink-0 place-items-center rounded-lg text-slate-400 transition hover:bg-white/5 hover:text-cyan focus:outline-none focus:ring-2 focus:ring-cyan/50" aria-label="Enable spoken responses" title="Enable spoken responses">
+                <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" class="h-5 w-5"><path d="M11 5 6 9H3v6h3l5 4V5Zm4 4a5 5 0 0 1 0 6m3-9a9 9 0 0 1 0 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
               <button id="send-button" type="submit" class="grid h-11 w-11 shrink-0 place-items-center rounded-lg bg-cyan text-void transition hover:bg-white focus:outline-none focus:ring-2 focus:ring-cyan/60 disabled:cursor-not-allowed disabled:opacity-40" aria-label="Send message">
                 <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" class="h-5 w-5"><path d="M4 12 20 4l-5.5 16-2.8-6.7L4 12Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="m11.7 13.3 4.1-4.1" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
               </button>
@@ -209,6 +212,7 @@
           systemLabel: document.getElementById("system-label"),
           unlockButton: document.getElementById("unlock-button"),
           voiceButton: document.getElementById("voice-button"),
+          voiceOutputButton: document.getElementById("voice-output-button"),
           voiceDot: document.getElementById("voice-dot"),
           voicePulse: document.getElementById("voice-pulse"),
           voiceStatus: document.getElementById("voice-status")
@@ -218,6 +222,7 @@
         let pendingMessage = null;
         let selectedImages = [];
         let chatHistory = [];
+        let voiceOutputEnabled = false;
         const welcomeMessage = elements.log.firstElementChild.cloneNode(true);
 
         function setHistoryNotice(message) {
@@ -357,6 +362,7 @@
           let paragraph = [];
           let list = null;
           let codeLines = null;
+          let codeLanguage = "";
 
           function flushParagraph() {
             if (!paragraph.length) return;
@@ -373,12 +379,12 @@
             list = null;
           }
 
-          function appendCodeBlock(lines) {
+          function appendCodeBlock(lines, language) {
             const source = lines.join("\n");
             const wrapper = document.createElement("div");
             wrapper.className = "relative overflow-hidden rounded-lg border border-white/10 bg-[#080d16]";
             const pre = document.createElement("pre");
-            pre.className = "overflow-x-auto p-4 pr-20 text-xs leading-5 text-cyan/90";
+            pre.className = "overflow-x-auto p-4 pr-40 text-xs leading-5 text-cyan/90";
             const code = document.createElement("code");
             code.className = "font-mono";
             code.textContent = source;
@@ -397,6 +403,36 @@
               }
               window.setTimeout(() => { copyButton.textContent = "Copy"; }, 2000);
             });
+            const extensions = {
+              json: "json",
+              jsonc: "json",
+              py: "py",
+              python: "py",
+              python3: "py",
+              text: "txt",
+              txt: "txt",
+              plaintext: "txt",
+              requirements: "txt",
+              "requirements.txt": "txt"
+            };
+            const extension = extensions[language.toLowerCase()];
+            if (extension && source.trim()) {
+              const downloadButton = document.createElement("button");
+              downloadButton.type = "button";
+              downloadButton.className = "absolute right-16 top-2 rounded-md border border-white/10 bg-slate-900/90 px-2 py-1 text-[10px] text-slate-300 transition hover:border-cyan/40 hover:text-cyan focus:outline-none focus:ring-2 focus:ring-cyan/50";
+              downloadButton.textContent = "Download";
+              downloadButton.setAttribute("aria-label", `Download code as ${extension} file`);
+              downloadButton.addEventListener("click", () => {
+                const file = new Blob([source], { type: "text/plain;charset=utf-8" });
+                const url = URL.createObjectURL(file);
+                const link = document.createElement("a");
+                link.href = url;
+                link.download = `cukur-ai-${Date.now()}.${extension}`;
+                link.click();
+                window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+              });
+              wrapper.append(downloadButton);
+            }
             pre.append(code);
             wrapper.append(pre, copyButton);
             container.append(wrapper);
@@ -406,10 +442,14 @@
             if (line.startsWith("```")) {
               flushParagraph();
               flushList();
-              if (codeLines === null) codeLines = [];
+              if (codeLines === null) {
+                codeLines = [];
+                codeLanguage = line.slice(3).trim().split(/\s+/)[0] || "";
+              }
               else {
-                appendCodeBlock(codeLines);
+                appendCodeBlock(codeLines, codeLanguage);
                 codeLines = null;
+                codeLanguage = "";
               }
             } else if (codeLines !== null) {
               codeLines.push(line);
@@ -440,7 +480,7 @@
 
           flushParagraph();
           flushList();
-          if (codeLines !== null) appendCodeBlock(codeLines);
+          if (codeLines !== null) appendCodeBlock(codeLines, codeLanguage);
         }
 
         function showImageError(message = "") {
@@ -580,6 +620,7 @@
             });
             saveChatHistory();
           }
+          return wrapper;
         }
 
         async function apiRequest(path, options = {}) {
@@ -592,6 +633,42 @@
             throw new Error(payload.detail || `Request failed (${response.status}).`);
           }
           return payload;
+        }
+
+        async function streamApiRequest(path, options, onDelta) {
+          const response = await fetch(new URL(path, window.location.origin), {
+            ...options,
+            headers: { "Content-Type": "application/json", ...(options.headers || {}) }
+          });
+          if (!response.ok) {
+            const payload = await response.json().catch(() => ({}));
+            throw new Error(payload.detail || `Request failed (${response.status}).`);
+          }
+          if (!response.body) throw new Error("This browser cannot read streamed responses.");
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+          let result = null;
+          function handleLine(line) {
+            if (!line.startsWith("data:")) return;
+            const event = JSON.parse(line.slice(5).trim());
+            if (event.type === "delta") onDelta(event.text);
+            else if (event.type === "done") result = event;
+            else if (event.type === "error") throw new Error(event.detail || "The assistant request failed.");
+          }
+
+          while (true) {
+            const { value, done } = await reader.read();
+            buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+            const lines = buffer.split(/\r?\n/);
+            buffer = lines.pop() || "";
+            for (const line of lines) handleLine(line);
+            if (done) break;
+          }
+          if (buffer.trim()) handleLine(buffer);
+          if (!result) throw new Error("The response stream ended before completion.");
+          return result;
         }
 
         function setBusy(busy) {
@@ -644,8 +721,10 @@
           appendMessage("user", message, "", images);
           elements.input.value = "";
           setBusy(true);
+          const partialWrapper = appendMessage("assistant", "", "", [], [], [], false);
+          const partialMessage = partialWrapper.querySelector(".space-y-2");
           try {
-            const result = await apiRequest("/api/chat", {
+            const result = await streamApiRequest("/api/chat", {
               method: "POST",
               headers: { "X-Developer-Code": developerCode },
               body: JSON.stringify({
@@ -654,7 +733,11 @@
                 images,
                 developer_mode: developerModeActive
               })
+            }, (delta) => {
+              partialMessage.textContent += delta;
+              elements.log.scrollTop = elements.log.scrollHeight;
             });
+            partialWrapper.remove();
             setDeveloperMode(Boolean(result.developer_mode_active));
             appendMessage(
               "assistant",
@@ -664,8 +747,10 @@
               result.sources || [],
               result.web_search_queries || []
             );
+            speakResponse(result.reply);
             if (result.auth_required) openAuthModal();
           } catch (error) {
+            partialWrapper.remove();
             appendMessage("assistant", error.message || "The request failed. Please try again.", "CONNECTION ERROR");
             elements.systemLabel.textContent = "Connection issue";
             elements.systemDot.classList.remove("bg-emerald-400", "bg-cyan");
@@ -673,6 +758,39 @@
           } finally {
             setBusy(false);
           }
+        }
+
+        function speakResponse(text) {
+          if (
+            !voiceOutputEnabled
+            || !("speechSynthesis" in window)
+            || typeof window.SpeechSynthesisUtterance !== "function"
+          ) return;
+          window.speechSynthesis.cancel();
+          window.speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+        }
+
+        elements.voiceOutputButton.addEventListener("click", () => {
+          voiceOutputEnabled = !voiceOutputEnabled;
+          elements.voiceOutputButton.setAttribute("aria-pressed", String(voiceOutputEnabled));
+          elements.voiceOutputButton.setAttribute(
+            "aria-label",
+            voiceOutputEnabled ? "Disable spoken responses" : "Enable spoken responses"
+          );
+          elements.voiceOutputButton.title = voiceOutputEnabled
+            ? "Spoken responses enabled"
+            : "Enable spoken responses";
+          elements.voiceOutputButton.classList.toggle("text-cyan", voiceOutputEnabled);
+          if (!voiceOutputEnabled && "speechSynthesis" in window) {
+            window.speechSynthesis.cancel();
+          }
+        });
+        if (
+          !("speechSynthesis" in window)
+          || typeof window.SpeechSynthesisUtterance !== "function"
+        ) {
+          elements.voiceOutputButton.disabled = true;
+          elements.voiceOutputButton.title = "Spoken responses are not supported by this browser.";
         }
 
         elements.chatForm.addEventListener("submit", async (event) => {
@@ -786,15 +904,22 @@
             setVoiceStatus("Listening", true);
             try {
               recognition.start();
-            } catch {
-              setVoiceStatus("Standby");
+            } catch (error) {
+              console.error("Could not start voice recognition.", error);
+              setVoiceStatus("Voice unavailable");
             }
           });
           recognition.addEventListener("result", (event) => {
-            elements.input.value = `${elements.input.value}${elements.input.value ? " " : ""}${event.results[0][0].transcript}`;
+            const transcript = event.results[0][0].transcript.trim();
+            if (!transcript) return;
+            elements.input.value = `${elements.input.value}${elements.input.value ? " " : ""}${transcript}`;
             elements.input.focus();
+            elements.chatForm.requestSubmit();
           });
-          recognition.addEventListener("error", () => setVoiceStatus("Voice unavailable"));
+          recognition.addEventListener("error", (event) => {
+            console.error("Voice recognition failed.", event.error);
+            setVoiceStatus("Voice unavailable");
+          });
           recognition.addEventListener("end", () => setVoiceStatus("Standby"));
         } else {
           elements.voiceButton.disabled = true;

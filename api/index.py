@@ -17,7 +17,8 @@ from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 import requests
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from mangum import Mangum
 from pydantic import BaseModel, ConfigDict, Field
 from psycopg2 import Error as PsycopgError
@@ -339,6 +340,14 @@ def _generate_reply(
     message: str,
     gemini_images: list[tuple[str, str]] | None = None,
 ) -> AICompletion:
+    return _call_llm_completion(
+        _chat_messages(session_id, message),
+        ollama_model="llama3",
+        gemini_images=gemini_images,
+    )
+
+
+def _chat_messages(session_id: str, message: str) -> list[dict[str, str]]:
     with _database_connection() as connection:
         try:
             with connection.cursor() as cursor:
@@ -374,12 +383,7 @@ def _generate_reply(
     ]
     messages.extend({"role": role, "content": text} for role, text in history)
     messages.append({"role": "user", "content": message})
-
-    return _call_llm_completion(
-        messages,
-        ollama_model="llama3",
-        gemini_images=gemini_images,
-    )
+    return messages
 
 
 def _call_llm(
@@ -617,6 +621,238 @@ def _call_gemini(
     )
 
 
+def _stream_gemini_completion(
+    messages: list[dict[str, Any]],
+    *,
+    gemini_images: list[tuple[str, str]] | None = None,
+) -> Iterator[str | AICompletion]:
+    api_key = settings.gemini_api_key
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Gemini is not configured on this server.")
+
+    system_parts: list[str] = []
+    contents: list[dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        text = message.get("content")
+        if not isinstance(text, str):
+            raise HTTPException(status_code=422, detail="AI message content must be text.")
+        if role == "system":
+            system_parts.append(text)
+        elif role in ("user", "assistant"):
+            contents.append(
+                {
+                    "role": "model" if role == "assistant" else "user",
+                    "parts": [{"text": text}],
+                }
+            )
+
+    if gemini_images:
+        user_content = next(
+            (content for content in reversed(contents) if content["role"] == "user"),
+            None,
+        )
+        if user_content is None:
+            raise HTTPException(status_code=422, detail="Image analysis requires a user message.")
+        user_content["parts"].extend(
+            {"inline_data": {"mime_type": media_type, "data": encoded_image}}
+            for media_type, encoded_image in gemini_images
+        )
+    if not contents:
+        raise HTTPException(status_code=422, detail="At least one user message is required.")
+
+    system_instruction = "\n".join(system_parts) or None
+    configs = (
+        genai_types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
+        ),
+        genai_types.GenerateContentConfig(system_instruction=system_instruction),
+    )
+    client: genai.Client | None = None
+    response_text: list[str] = []
+    grounding_metadata: Any = None
+    try:
+        client = genai.Client(api_key=api_key)
+        for config_index, config in enumerate(configs):
+            try:
+                for chunk in client.models.generate_content_stream(
+                    model=GEMINI_MODEL,
+                    contents=contents,
+                    config=config,
+                ):
+                    candidates = chunk.candidates or []
+                    if candidates and candidates[0].grounding_metadata:
+                        grounding_metadata = candidates[0].grounding_metadata
+                    text = chunk.text
+                    if isinstance(text, str) and text:
+                        response_text.append(text)
+                        yield text
+                break
+            except genai_errors.ClientError as exc:
+                error_detail = str(exc).lower()
+                is_search_tool_error = exc.code == 400 and any(
+                    marker in error_detail
+                    for marker in ("google_search", "google search", "grounding", "tool")
+                )
+                if config_index != 0 or not is_search_tool_error or response_text:
+                    raise
+                logger.warning(
+                    "Gemini rejected Google Search grounding; retrying stream without it."
+                )
+        if not "".join(response_text).strip():
+            logger.error("Gemini returned an empty streamed response.")
+            raise HTTPException(
+                status_code=502,
+                detail="Gemini returned an empty response.",
+            )
+        sources_by_uri: dict[str, dict[str, str]] = {}
+        if grounding_metadata:
+            for chunk in grounding_metadata.grounding_chunks or []:
+                web_source = chunk.web
+                if web_source is None:
+                    continue
+                uri = web_source.uri
+                title = web_source.title
+                if isinstance(uri, str) and uri.startswith(("https://", "http://")):
+                    sources_by_uri[uri] = {
+                        "title": title if isinstance(title, str) and title else uri,
+                        "uri": uri,
+                    }
+        web_search_queries = (
+            [
+                query
+                for query in (grounding_metadata.web_search_queries or [])
+                if isinstance(query, str)
+            ]
+            if grounding_metadata
+            else []
+        )
+        yield AICompletion(
+            text="".join(response_text).strip(),
+            grounding_metadata=grounding_metadata,
+            sources=list(sources_by_uri.values()),
+            web_search_queries=web_search_queries,
+        )
+    except HTTPException:
+        raise
+    except genai_errors.APIError as exc:
+        logger.exception("Gemini streaming request failed with HTTP %s.", exc.code)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini rejected the request (HTTP {exc.code}). Check model and API key.",
+        ) from exc
+    except (ValueError, TypeError, AttributeError) as exc:
+        logger.exception("Gemini streaming request returned an invalid response.")
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini is unavailable or returned an invalid response.",
+        ) from exc
+    finally:
+        if client is not None:
+            client.close()
+
+
+def _stream_completion(
+    messages: list[dict[str, Any]],
+    *,
+    ollama_model: str,
+    gemini_images: list[tuple[str, str]] | None = None,
+) -> Iterator[str | AICompletion]:
+    if settings.gemini_api_key:
+        yield from _stream_gemini_completion(messages, gemini_images=gemini_images)
+        return
+    if gemini_images:
+        raise HTTPException(
+            status_code=503,
+            detail="Image chat requires GEMINI_API_KEY to be configured.",
+        )
+
+    response_text: list[str] = []
+    try:
+        if settings.ollama_host:
+            response = requests.post(
+                f"{settings.ollama_host.rstrip('/')}/api/chat",
+                json={
+                    "model": ollama_model,
+                    "messages": messages,
+                    "stream": True,
+                },
+                timeout=(5, 60),
+                stream=True,
+            )
+            is_openai = False
+        elif settings.openai_api_key:
+            response = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {settings.openai_api_key}"},
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": messages,
+                    "stream": True,
+                },
+                timeout=(5, 60),
+                stream=True,
+            )
+            is_openai = True
+        else:
+            raise HTTPException(
+                status_code=503,
+                detail="No AI provider is configured. Set GEMINI_API_KEY, OLLAMA_HOST, "
+                "or OPENAI_API_KEY.",
+            )
+
+        with response:
+            response.raise_for_status()
+            for raw_line in response.iter_lines():
+                line = (
+                    raw_line.decode("utf-8")
+                    if isinstance(raw_line, bytes)
+                    else raw_line
+                )
+                if not line:
+                    continue
+                if is_openai:
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    data = json.loads(payload)
+                    choices = data.get("choices", [])
+                    delta = choices[0].get("delta", {}).get("content") if choices else None
+                else:
+                    data = json.loads(line)
+                    delta = data.get("message", {}).get("content")
+                if isinstance(delta, str) and delta:
+                    response_text.append(delta)
+                    yield delta
+    except HTTPException:
+        raise
+    except (
+        requests.RequestException,
+        ValueError,
+        KeyError,
+        IndexError,
+        TypeError,
+        AttributeError,
+    ) as exc:
+        logger.exception("The configured AI provider could not stream a response.")
+        raise HTTPException(
+            status_code=502,
+            detail="The configured AI provider is unavailable or returned an invalid response.",
+        ) from exc
+
+    text = "".join(response_text).strip()
+    if not text:
+        logger.error("The configured AI provider returned an empty streamed response.")
+        raise HTTPException(
+            status_code=502,
+            detail="The configured AI provider returned an empty response.",
+        )
+    yield AICompletion(text=text)
+
+
 def _completion_response_fields(completion: AICompletion) -> dict[str, Any]:
     return {
         "grounding_metadata": completion.grounding_metadata,
@@ -743,7 +979,7 @@ def verify_developer_mode(request: VerifyRequest) -> dict[str, Any]:
 def chat(
     request: ChatRequest,
     _: None = Depends(require_developer_code),
-) -> dict[str, Any]:
+) -> StreamingResponse:
     developer_mode_active = True
     gemini_images = [
         (image.media_type, _decode_image(image))
@@ -754,47 +990,80 @@ def chat(
             status_code=413,
             detail="Combined image data must not exceed 3 MB before base64 encoding.",
         )
-    if not settings.neon_database_url:
-        completion = _call_llm_completion(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are Cukur AI, a clear, capable virtual assistant. "
-                        "Do not claim to have executed actions or accessed systems. "
-                        "Developer Mode is an authorization state, not a grant of tools."
-                    ),
-                },
-                {"role": "user", "content": request.message},
-            ],
-            ollama_model="llama3",
-            gemini_images=gemini_images,
-        )
-        return {
-            "session_id": request.session_id,
-            "reply": completion.text,
-            "developer_mode_active": developer_mode_active,
-            "auth_required": False,
-            "persistence_enabled": False,
-            **_completion_response_fields(completion),
-        }
+    persistence_enabled = bool(settings.neon_database_url)
+    if persistence_enabled:
+        _ensure_schema()
+        messages = _chat_messages(request.session_id, request.message)
+    else:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are Cukur AI, a clear, capable virtual assistant. "
+                    "Do not claim to have executed actions or accessed systems. "
+                    "Developer Mode is an authorization state, not a grant of tools."
+                ),
+            },
+            {"role": "user", "content": request.message},
+        ]
 
-    _ensure_schema()
-    completion = _generate_reply(request.session_id, request.message, gemini_images)
-    _save_messages(
-        request.session_id,
-        request.message,
-        completion.text,
-        developer_mode_active,
+    def event_stream() -> Iterator[str]:
+        chunks: list[str] = []
+        completion: AICompletion | None = None
+        try:
+            for item in _stream_completion(
+                messages,
+                ollama_model="llama3",
+                gemini_images=gemini_images,
+            ):
+                if isinstance(item, str):
+                    chunks.append(item)
+                    event = {"type": "delta", "text": item}
+                else:
+                    completion = item
+                    event = None
+                if event is not None:
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+            if completion is None:
+                completion = AICompletion(text="".join(chunks).strip())
+            if persistence_enabled:
+                _save_messages(
+                    request.session_id,
+                    request.message,
+                    completion.text,
+                    developer_mode_active,
+                )
+            done_event = {
+                "type": "done",
+                "session_id": request.session_id,
+                "reply": completion.text,
+                "developer_mode_active": developer_mode_active,
+                "auth_required": False,
+                "persistence_enabled": persistence_enabled,
+                **_completion_response_fields(completion),
+            }
+            yield f"data: {json.dumps(jsonable_encoder(done_event), ensure_ascii=False)}\n\n"
+        except HTTPException as exc:
+            error_event = {"type": "error", "detail": exc.detail}
+            yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
+        except Exception:
+            logger.exception("Chat response stream failed.")
+            error_event = {
+                "type": "error",
+                "detail": "The assistant could not complete this request.",
+            }
+            yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
-    return {
-        "session_id": request.session_id,
-        "reply": completion.text,
-        "developer_mode_active": developer_mode_active,
-        "auth_required": False,
-        "persistence_enabled": True,
-        **_completion_response_fields(completion),
-    }
 
 
 @app.post("/api/ai/prompt", dependencies=[Depends(require_developer_code)])

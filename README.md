@@ -24,3 +24,7 @@ and search queries are saved in browser local storage for the current session;
 use **Clear chat** to remove that local history. Gemini requests enable Google
 Search grounding and chat responses include any returned grounding metadata,
 web source links, and search queries.
+
+Chat replies stream to the dashboard as they are generated. Browser speech input
+and optional spoken replies use the Web Speech APIs when supported. Fenced
+Python, JSON, and text code blocks include a local download action.

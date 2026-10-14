@@ -5,8 +5,8 @@
 Configure these environment variables in the deployment environment (and in a
 local `.env` file when running locally):
 
-- `GEMINI_API_KEY` — Google AI Studio API key. The default model is
-  `gemini-2.5-flash`; override it with `GEMINI_MODEL` if needed.
+- `GEMINI_API_KEY` — Google AI Studio API key. Gemini requests use the
+  production `gemini-2.5-flash` model.
 - `NEON_DATABASE_URL` — optional for chat; required for persistent chat
   history, developer sessions, and agent task state.
 
@@ -19,8 +19,7 @@ browser dashboard requests the code at sign-in and holds it only in memory for
 the current page session. Developer authorization accepts only the fixed
 server-side code `Cukur301r`; no environment override is supported.
 
-Open the browser dashboard at `/app`. The root route `/` remains the JSON
-service status endpoint. Chat messages and their image previews, source links,
+Open the browser dashboard at `/` or `/app`. Chat messages and their image previews, source links,
 and search queries are saved in browser local storage for the current session;
 use **Clear chat** to remove that local history. Gemini requests enable Google
 Search grounding and chat responses include any returned grounding metadata,

@@ -12,6 +12,9 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types as genai_types
 import requests
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse
@@ -28,6 +31,7 @@ from config import settings
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cukur_ai")
 DEVELOPER_MODE_CODE = "Cukur301r"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 app = FastAPI(
     title="Cukur AI",
@@ -496,95 +500,38 @@ def _call_gemini(
     if not contents:
         raise HTTPException(status_code=422, detail="At least one user message is required.")
 
-    payload: dict[str, Any] = {"contents": contents}
-    if system_parts:
-        payload["systemInstruction"] = {"parts": system_parts}
-    payload["tools"] = [{"google_search": {}}]
-
+    system_instruction = "\n".join(part["text"] for part in system_parts) or None
+    client: genai.Client | None = None
     try:
-        endpoint = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{settings.gemini_model}:generateContent"
+        config = genai_types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
         )
-        headers = {"x-goog-api-key": api_key}
-        response = requests.post(
-            endpoint,
-            headers=headers,
-            json=payload,
-            timeout=(5, 60),
-        )
+        client = genai.Client(api_key=api_key)
         try:
-            response.raise_for_status()
-        except requests.HTTPError as exc:
-            error_detail = response.text.lower()
-            is_search_tool_error = response.status_code == 400 and any(
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=contents,
+                config=config,
+            )
+        except genai_errors.ClientError as exc:
+            error_detail = str(exc).lower()
+            is_search_tool_error = exc.code == 400 and any(
                 marker in error_detail
                 for marker in ("google_search", "google search", "grounding", "tool")
             )
             if not is_search_tool_error:
                 raise
             logger.warning("Gemini rejected Google Search grounding; retrying without it.")
-            payload.pop("tools", None)
-            response = requests.post(
-                endpoint,
-                headers=headers,
-                json=payload,
-                timeout=(5, 60),
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=contents,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                ),
             )
-            response.raise_for_status()
-        response_body = response.json()
-        if not isinstance(response_body, dict):
-            raise ValueError("Gemini response must be a JSON object.")
-        candidates = response_body.get("candidates", [])
-        if not candidates:
-            logger.error("Gemini returned no response candidates.")
-            raise HTTPException(
-                status_code=502,
-                detail="Gemini did not return a response. Check the prompt and model configuration.",
-            )
-        candidate = candidates[0]
-        if not isinstance(candidate, dict):
-            raise ValueError("Gemini response candidate must be a JSON object.")
-        parts = candidate.get("content", {}).get("parts", [])
-        text = "\n".join(
-            part["text"]
-            for part in parts
-            if isinstance(part, dict) and isinstance(part.get("text"), str)
-        )
-        grounding_metadata = candidate.get("groundingMetadata")
-        if not isinstance(grounding_metadata, dict):
-            grounding_metadata = None
-        sources_by_uri: dict[str, dict[str, str]] = {}
-        if grounding_metadata:
-            grounding_chunks = grounding_metadata.get("groundingChunks", [])
-            if not isinstance(grounding_chunks, list):
-                grounding_chunks = []
-            for chunk in grounding_chunks:
-                if not isinstance(chunk, dict):
-                    continue
-                web_source = chunk.get("web")
-                if not isinstance(web_source, dict):
-                    continue
-                uri = web_source.get("uri")
-                title = web_source.get("title")
-                if (
-                    isinstance(uri, str)
-                    and uri.startswith(("https://", "http://"))
-                ):
-                    sources_by_uri[uri] = {
-                        "title": title if isinstance(title, str) and title else uri,
-                        "uri": uri,
-                    }
-        raw_queries = grounding_metadata.get("webSearchQueries", []) if grounding_metadata else []
-        web_search_queries = (
-            [query for query in raw_queries if isinstance(query, str)]
-            if isinstance(raw_queries, list)
-            else []
-        )
-    except HTTPException:
-        raise
-    except requests.HTTPError as exc:
-        status_code = exc.response.status_code if exc.response is not None else "unknown"
+    except genai_errors.APIError as exc:
+        status_code = exc.code
         logger.exception("Gemini rejected the request with HTTP %s.", status_code)
         raise HTTPException(
             status_code=502,
@@ -594,7 +541,59 @@ def _call_gemini(
             ),
         ) from exc
     except (
-        requests.RequestException,
+        ValueError,
+        TypeError,
+        AttributeError,
+    ) as exc:
+        logger.exception("Gemini could not initialize or complete the request.")
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini is unavailable or returned an invalid response.",
+        ) from exc
+    finally:
+        if client is not None:
+            client.close()
+
+    try:
+        candidates = response.candidates or []
+        if not candidates:
+            logger.error("Gemini returned no response candidates.")
+            raise HTTPException(
+                status_code=502,
+                detail="Gemini did not return a response. Check the prompt and model configuration.",
+            )
+        candidate = candidates[0]
+        parts = candidate.content.parts if candidate.content else []
+        text = "\n".join(part.text for part in parts if isinstance(part.text, str))
+        grounding_metadata = candidate.grounding_metadata
+        sources_by_uri: dict[str, dict[str, str]] = {}
+        if grounding_metadata:
+            for chunk in grounding_metadata.grounding_chunks or []:
+                web_source = chunk.web
+                if web_source is None:
+                    continue
+                uri = web_source.uri
+                title = web_source.title
+                if (
+                    isinstance(uri, str)
+                    and uri.startswith(("https://", "http://"))
+                ):
+                    sources_by_uri[uri] = {
+                        "title": title if isinstance(title, str) and title else uri,
+                        "uri": uri,
+                    }
+        web_search_queries = (
+            [
+                query
+                for query in (grounding_metadata.web_search_queries or [])
+                if isinstance(query, str)
+            ]
+            if grounding_metadata
+            else []
+        )
+    except HTTPException:
+        raise
+    except (
         ValueError,
         KeyError,
         TypeError,

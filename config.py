@@ -13,7 +13,6 @@ class Settings(BaseSettings):
     ollama_host: str | None = Field(default=None, alias="OLLAMA_HOST")
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     gemini_api_key: str | None = Field(default=None, alias="GEMINI_API_KEY")
-    gemini_model: str = Field(default="gemini-2.5-flash", alias="GEMINI_MODEL")
 
 
 settings = Settings()

@@ -2,17 +2,18 @@ import base64
 import binascii
 import json
 import logging
-import re
 import secrets
 import threading
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
 import requests
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import FileResponse
 from mangum import Mangum
 from pydantic import BaseModel, ConfigDict, Field
 from psycopg2 import Error as PsycopgError
@@ -25,7 +26,7 @@ from config import settings
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cukur_ai")
-DEVELOPER_ACCESS_CODE = "Cukur301r"
+DEVELOPER_MODE_CODE = "Cukur301r"
 
 app = FastAPI(
     title="Cukur AI",
@@ -45,25 +46,21 @@ _pool_lock = threading.Lock()
 _schema_ready = False
 _schema_lock = threading.Lock()
 
-_RESTRICTED_PATTERNS = tuple(
-    re.compile(pattern, re.IGNORECASE)
-    for pattern in (
-        r"\b(?:run|execute)\s+(?:a\s+)?(?:shell|terminal|system)\s+commands?\b",
-        r"\b(?:execute|run)\s+(?:arbitrary\s+)?(?:python|javascript|code)\b",
-        r"\b(?:delete|drop|truncate)\s+(?:the\s+)?(?:database|table|all\s+data)\b",
-        r"\b(?:access|reveal|dump)\s+(?:the\s+)?(?:secret|credentials|api\s+key|passwords?)\b",
-        r"\b(?:bypass|disable)\s+(?:security|authentication|auth)\b",
-        r"\bsudo\b",
-    )
-)
-
-
 class ChatRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     session_id: str = Field(min_length=1, max_length=128)
     message: str = Field(min_length=1, max_length=8000)
     developer_mode: bool = False
+    images: list[ImageContext] = Field(default_factory=list, max_length=4)
+
+
+class ImageContext(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    media_type: str = Field(pattern=r"^image/(?:png|jpeg|webp|gif)$")
+    data: str = Field(min_length=1, max_length=8_000_000)
+    description: str | None = Field(default=None, max_length=1000)
 
 
 class VerifyRequest(BaseModel):
@@ -81,14 +78,6 @@ class PromptRequest(BaseModel):
         default="You are Cukur AI, a capable and clear virtual assistant.",
         max_length=4000,
     )
-
-
-class ImageContext(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
-
-    media_type: str = Field(pattern=r"^image/(?:png|jpeg|webp|gif)$")
-    data: str = Field(min_length=1, max_length=8_000_000)
-    description: str | None = Field(default=None, max_length=1000)
 
 
 class ImageAnalysisRequest(BaseModel):
@@ -151,7 +140,8 @@ def require_developer_code(
     x_developer_code: str | None = Header(default=None, alias="X-Developer-Code"),
 ) -> None:
     if not x_developer_code or not secrets.compare_digest(
-        x_developer_code, DEVELOPER_ACCESS_CODE
+        x_developer_code,
+        DEVELOPER_MODE_CODE,
     ):
         raise HTTPException(status_code=403, detail="Developer authorization required.")
 
@@ -277,10 +267,6 @@ def _ensure_schema() -> None:
                 ) from exc
 
 
-def _restricted_request(message: str) -> bool:
-    return any(pattern.search(message) for pattern in _RESTRICTED_PATTERNS)
-
-
 def _get_session_state(session_id: str) -> bool:
     with _database_connection() as connection:
         try:
@@ -335,7 +321,11 @@ def _save_messages(
             ) from exc
 
 
-def _generate_reply(session_id: str, message: str) -> str:
+def _generate_reply(
+    session_id: str,
+    message: str,
+    gemini_images: list[tuple[str, str]] | None = None,
+) -> str:
     with _database_connection() as connection:
         try:
             with connection.cursor() as cursor:
@@ -372,15 +362,27 @@ def _generate_reply(session_id: str, message: str) -> str:
     messages.extend({"role": role, "content": text} for role, text in history)
     messages.append({"role": "user", "content": message})
 
-    return _call_llm(messages, ollama_model="llama3")
+    return _call_llm(
+        messages,
+        ollama_model="llama3",
+        gemini_images=gemini_images,
+    )
 
 
 def _call_llm(
     messages: list[dict[str, Any]],
     *,
     ollama_model: str,
+    gemini_images: list[tuple[str, str]] | None = None,
 ) -> str:
     try:
+        if gemini_images and not settings.gemini_api_key:
+            raise HTTPException(
+                status_code=503,
+                detail="Image chat requires GEMINI_API_KEY to be configured.",
+            )
+        if settings.gemini_api_key:
+            return _call_gemini(messages, gemini_images=gemini_images)
         if settings.ollama_host:
             response = requests.post(
                 f"{settings.ollama_host.rstrip('/')}/api/chat",
@@ -401,7 +403,10 @@ def _call_llm(
         else:
             raise HTTPException(
                 status_code=503,
-                detail="No AI provider is configured. Set OLLAMA_HOST or OPENAI_API_KEY.",
+                detail=(
+                    "No AI provider is configured. Set GEMINI_API_KEY, OLLAMA_HOST, "
+                    "or OPENAI_API_KEY."
+                ),
             )
     except HTTPException:
         raise
@@ -419,6 +424,100 @@ def _call_llm(
             detail="The configured AI provider returned an empty response.",
         )
     return content.strip()
+
+
+def _call_gemini(
+    messages: list[dict[str, Any]],
+    *,
+    gemini_images: list[tuple[str, str]] | None = None,
+) -> str:
+    api_key = settings.gemini_api_key
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Gemini is not configured on this server.")
+
+    system_parts: list[dict[str, str]] = []
+    contents: list[dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        text = message.get("content")
+        if not isinstance(text, str):
+            raise HTTPException(status_code=422, detail="AI message content must be text.")
+        if role == "system":
+            system_parts.append({"text": text})
+        elif role in ("user", "assistant"):
+            contents.append(
+                {
+                    "role": "model" if role == "assistant" else "user",
+                    "parts": [{"text": text}],
+                }
+            )
+
+    if gemini_images:
+        user_content = next(
+            (content for content in reversed(contents) if content["role"] == "user"),
+            None,
+        )
+        if user_content is None:
+            raise HTTPException(status_code=422, detail="Image analysis requires a user message.")
+        user_content["parts"].extend(
+            {"inline_data": {"mime_type": media_type, "data": encoded_image}}
+            for media_type, encoded_image in gemini_images
+        )
+
+    if not contents:
+        raise HTTPException(status_code=422, detail="At least one user message is required.")
+
+    payload: dict[str, Any] = {"contents": contents}
+    if system_parts:
+        payload["systemInstruction"] = {"parts": system_parts}
+
+    try:
+        response = requests.post(
+            (
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{settings.gemini_model}:generateContent"
+            ),
+            headers={"x-goog-api-key": api_key},
+            json=payload,
+            timeout=(5, 60),
+        )
+        response.raise_for_status()
+        response_body = response.json()
+        if not isinstance(response_body, dict):
+            raise ValueError("Gemini response must be a JSON object.")
+        candidates = response_body.get("candidates", [])
+        if not candidates:
+            logger.error("Gemini returned no response candidates.")
+            raise HTTPException(
+                status_code=502,
+                detail="Gemini did not return a response. Check the prompt and model configuration.",
+            )
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text = "\n".join(
+            part["text"]
+            for part in parts
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        )
+    except HTTPException:
+        raise
+    except (
+        requests.RequestException,
+        ValueError,
+        KeyError,
+        TypeError,
+        IndexError,
+        AttributeError,
+    ) as exc:
+        logger.exception("Gemini could not complete the request.")
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini is unavailable or returned an invalid response.",
+        ) from exc
+
+    if not text.strip():
+        logger.error("Gemini returned an empty response.")
+        raise HTTPException(status_code=502, detail="Gemini returned an empty response.")
+    return text.strip()
 
 
 def _decode_image(image: ImageContext) -> str:
@@ -456,6 +555,15 @@ def root() -> dict[str, str]:
     return {"message": "Welcome to Cukur AI", "status": "ok"}
 
 
+@app.get("/app", include_in_schema=False)
+def dashboard() -> FileResponse:
+    dashboard_path = Path(__file__).resolve().parent.parent / "public" / "index.html"
+    if not dashboard_path.is_file():
+        logger.error("Dashboard HTML was not found at %s.", dashboard_path)
+        raise HTTPException(status_code=404, detail="Dashboard is unavailable.")
+    return FileResponse(dashboard_path)
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     _ensure_schema()
@@ -464,18 +572,33 @@ def health() -> dict[str, str]:
 
 @app.get("/api/session/{session_id}")
 def session_status(session_id: str) -> dict[str, Any]:
+    if not settings.neon_database_url:
+        return {
+            "session_id": session_id,
+            "developer_mode_active": False,
+            "persistence_enabled": False,
+        }
     _ensure_schema()
     return {
         "session_id": session_id,
         "developer_mode_active": _get_session_state(session_id),
+        "persistence_enabled": True,
     }
 
 
 @app.post("/api/verify")
 def verify_developer_mode(request: VerifyRequest) -> dict[str, Any]:
-    _ensure_schema()
-    if not secrets.compare_digest(request.code, DEVELOPER_ACCESS_CODE):
+    if not secrets.compare_digest(request.code, DEVELOPER_MODE_CODE):
         raise HTTPException(status_code=401, detail="Invalid authentication code.")
+
+    if not settings.neon_database_url:
+        return {
+            "session_id": request.session_id,
+            "developer_mode_active": True,
+            "persistence_enabled": False,
+        }
+
+    _ensure_schema()
 
     with _database_connection() as connection:
         try:
@@ -498,25 +621,54 @@ def verify_developer_mode(request: VerifyRequest) -> dict[str, Any]:
                 detail="Could not save Developer Mode status to Neon.",
             ) from exc
 
-    return {"session_id": request.session_id, "developer_mode_active": True}
+    return {
+        "session_id": request.session_id,
+        "developer_mode_active": True,
+        "persistence_enabled": True,
+    }
 
 
 @app.post("/api/chat")
-def chat(request: ChatRequest) -> dict[str, Any]:
-    _ensure_schema()
-    developer_mode_active = _get_session_state(request.session_id)
-
-    if _restricted_request(request.message) and not developer_mode_active:
-        reply = "Authentication required. Verify your developer code to continue."
-        _save_messages(request.session_id, request.message, reply, False)
+def chat(
+    request: ChatRequest,
+    _: None = Depends(require_developer_code),
+) -> dict[str, Any]:
+    developer_mode_active = True
+    gemini_images = [
+        (image.media_type, _decode_image(image))
+        for image in request.images
+    ]
+    if sum(len(encoded_image) for _, encoded_image in gemini_images) > 4_000_000:
+        raise HTTPException(
+            status_code=413,
+            detail="Combined image data must not exceed 3 MB before base64 encoding.",
+        )
+    if not settings.neon_database_url:
+        reply = _call_llm(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Cukur AI, a clear, capable virtual assistant. "
+                        "Do not claim to have executed actions or accessed systems. "
+                        "Developer Mode is an authorization state, not a grant of tools."
+                    ),
+                },
+                {"role": "user", "content": request.message},
+            ],
+            ollama_model="llama3",
+            gemini_images=gemini_images,
+        )
         return {
             "session_id": request.session_id,
             "reply": reply,
-            "developer_mode_active": False,
-            "auth_required": True,
+            "developer_mode_active": developer_mode_active,
+            "auth_required": False,
+            "persistence_enabled": False,
         }
 
-    reply = _generate_reply(request.session_id, request.message)
+    _ensure_schema()
+    reply = _generate_reply(request.session_id, request.message, gemini_images)
     _save_messages(
         request.session_id,
         request.message,
@@ -528,6 +680,7 @@ def chat(request: ChatRequest) -> dict[str, Any]:
         "reply": reply,
         "developer_mode_active": developer_mode_active,
         "auth_required": False,
+        "persistence_enabled": True,
     }
 
 
@@ -543,13 +696,33 @@ def process_prompt(request: PromptRequest) -> dict[str, str]:
 @app.post("/api/ai/images/analyze", dependencies=[Depends(require_developer_code)])
 def analyze_images(request: ImageAnalysisRequest) -> dict[str, str]:
     encoded_images = [_decode_image(image) for image in request.images]
+    if sum(len(encoded) for encoded in encoded_images) > 4_000_000:
+        raise HTTPException(
+            status_code=413,
+            detail="Combined image data must not exceed 3 MB before base64 encoding.",
+        )
     image_context = "\n".join(
         f"Image {index}: {image.description or 'No additional description.'}"
         for index, image in enumerate(request.images, start=1)
     )
     prompt = f"{request.prompt}\n\nImage context:\n{image_context}"
 
-    if settings.ollama_host:
+    if settings.gemini_api_key:
+        result = _call_llm(
+            [
+                {
+                    "role": "system",
+                    "content": "Analyze the supplied images and answer accurately. State uncertainty.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            ollama_model="llava",
+            gemini_images=[
+                (image.media_type, encoded)
+                for image, encoded in zip(request.images, encoded_images)
+            ],
+        )
+    elif settings.ollama_host:
         messages = [
             {
                 "role": "system",
@@ -583,7 +756,10 @@ def analyze_images(request: ImageAnalysisRequest) -> dict[str, str]:
     else:
         raise HTTPException(
             status_code=503,
-            detail="No AI provider is configured. Set OLLAMA_HOST or OPENAI_API_KEY.",
+            detail=(
+                "No AI provider is configured. Set GEMINI_API_KEY, OLLAMA_HOST, "
+                "or OPENAI_API_KEY."
+            ),
         )
     return {"analysis": result}
 

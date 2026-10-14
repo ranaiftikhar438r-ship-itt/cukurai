@@ -14,7 +14,7 @@ from typing import Any
 
 import requests
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from mangum import Mangum
 from pydantic import BaseModel, ConfigDict, Field
 from psycopg2 import Error as PsycopgError
@@ -657,8 +657,14 @@ def initialize_database() -> None:
 
 
 @app.get("/")
-def root() -> dict[str, str]:
-    return {"message": "Welcome to Cukur AI", "status": "ok"}
+def root() -> HTMLResponse:
+    dashboard_path = Path(__file__).resolve().parent.parent / "public" / "index.html"
+    try:
+        dashboard_html = dashboard_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.exception("Could not read dashboard HTML from %s.", dashboard_path)
+        raise HTTPException(status_code=500, detail="Dashboard is unavailable.") from exc
+    return HTMLResponse(content=dashboard_html)
 
 
 @app.get("/app", include_in_schema=False)

@@ -28,3 +28,9 @@ web source links, and search queries.
 Chat replies stream to the dashboard as they are generated. Browser speech input
 and optional spoken replies use the Web Speech APIs when supported. Fenced
 Python, JSON, and text code blocks include a local download action.
+
+Real-time Niko voice uses a one-use, short-lived Gemini Live token issued by the
+developer-authorized `/api/live/token` endpoint; the browser connects directly to
+Gemini for microphone streaming. Medical-image and health responses are instructed
+to distinguish observations from possibilities, provide general information only,
+verify physical product labels, and include a clinician disclaimer.

@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,29 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cukur_ai")
 DEVELOPER_MODE_CODE = "Cukur301r"
 GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_LIVE_MODEL = "gemini-3.8-live"
+NIKO_PERSONA_INSTRUCTIONS = (
+    "You are Niko, a highly analytical, observant, and dependable conversational "
+    "companion. Speak clearly, calmly, and naturally. Do not claim a measured IQ "
+    "or abilities you do not have. Do not claim to operate devices or take actions "
+    "outside this conversation. "
+    "For medical questions or human medical imagery/data: first list only raw, "
+    "directly observable features and uncertainty; never give a definitive diagnosis; "
+    "describe at least three distinct possibilities using cautious language such as "
+    "'could resemble' or 'may be consistent with'; give at least three distinct "
+    "general management options for wellness advice; ask the user to verify physical "
+    "product labels and consult a qualified clinician; and always end with this exact "
+    "sentence: 'Consult a licensed medical professional before making any health decisions.'"
+)
+MEDICAL_IMAGE_INSTRUCTIONS = (
+    "When the user asks about medical imagery or human medical data, start by listing "
+    "the raw visual features observed before interpretation. Do not present a definitive "
+    "diagnosis; use hedged language and list at least three distinct possible explanations. "
+    "Any wellness or remediation advice must give at least three distinct general options. "
+    "Tell the user to double-check physical product labels. State that the information is "
+    "general only and append exactly: 'Consult a licensed medical professional before "
+    "making any health decisions.'"
+)
 
 app = FastAPI(
     title="Cukur AI",
@@ -74,6 +98,12 @@ class VerifyRequest(BaseModel):
 
     session_id: str = Field(min_length=1, max_length=128)
     code: str = Field(min_length=1, max_length=256)
+
+
+class LiveTokenRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    session_id: str = Field(min_length=1, max_length=128)
 
 
 class PromptRequest(BaseModel):
@@ -375,9 +405,10 @@ def _chat_messages(session_id: str, message: str) -> list[dict[str, str]]:
         {
             "role": "system",
             "content": (
-                "You are Cukur AI, a clear, capable virtual assistant. "
+                f"{NIKO_PERSONA_INSTRUCTIONS} "
                 "Do not claim to have executed actions or accessed systems. "
-                "Developer Mode is an authorization state, not a grant of tools."
+                "Developer Mode is an authorization state, not a grant of tools. "
+                f"{MEDICAL_IMAGE_INSTRUCTIONS}"
             ),
         }
     ]
@@ -975,6 +1006,62 @@ def verify_developer_mode(request: VerifyRequest) -> dict[str, Any]:
     }
 
 
+@app.post("/api/live/token", dependencies=[Depends(require_developer_code)])
+def create_live_token(request: LiveTokenRequest) -> dict[str, str]:
+    if not settings.gemini_api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Live voice requires GEMINI_API_KEY to be configured.",
+        )
+
+    now = datetime.now(timezone.utc)
+    live_config = genai_types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        system_instruction=NIKO_PERSONA_INSTRUCTIONS,
+        input_audio_transcription=genai_types.AudioTranscriptionConfig(),
+        output_audio_transcription=genai_types.AudioTranscriptionConfig(),
+    )
+    client: genai.Client | None = None
+    try:
+        client = genai.Client(api_key=settings.gemini_api_key)
+        token = client.auth_tokens.create(
+            config=genai_types.CreateAuthTokenConfig(
+                uses=1,
+                expire_time=now + timedelta(minutes=30),
+                new_session_expire_time=now + timedelta(seconds=60),
+                live_connect_constraints=genai_types.LiveConnectConstraints(
+                    model=f"models/{GEMINI_LIVE_MODEL}",
+                    config=live_config,
+                ),
+            )
+        )
+    except genai_errors.APIError as exc:
+        logger.exception("Could not create a Gemini Live session token.")
+        raise HTTPException(
+            status_code=502,
+            detail="Could not initialize Gemini Live voice.",
+        ) from exc
+    except (ValueError, TypeError) as exc:
+        logger.exception("Gemini Live token configuration was invalid.")
+        raise HTTPException(
+            status_code=502,
+            detail="Could not initialize Gemini Live voice.",
+        ) from exc
+    finally:
+        if client is not None:
+            client.close()
+
+    if not token.name:
+        logger.error("Gemini returned an empty Live API token.")
+        raise HTTPException(status_code=502, detail="Gemini returned an invalid Live token.")
+    return {
+        "token": token.name,
+        "model": GEMINI_LIVE_MODEL,
+        "persona": NIKO_PERSONA_INSTRUCTIONS,
+        "session_id": request.session_id,
+    }
+
+
 @app.post("/api/chat")
 def chat(
     request: ChatRequest,
@@ -999,9 +1086,10 @@ def chat(
             {
                 "role": "system",
                 "content": (
-                    "You are Cukur AI, a clear, capable virtual assistant. "
+                    f"{NIKO_PERSONA_INSTRUCTIONS} "
                     "Do not claim to have executed actions or accessed systems. "
-                    "Developer Mode is an authorization state, not a grant of tools."
+                    "Developer Mode is an authorization state, not a grant of tools. "
+                    f"{MEDICAL_IMAGE_INSTRUCTIONS}"
                 ),
             },
             {"role": "user", "content": request.message},
@@ -1069,7 +1157,10 @@ def chat(
 @app.post("/api/ai/prompt", dependencies=[Depends(require_developer_code)])
 def process_prompt(request: PromptRequest) -> dict[str, str]:
     messages = [
-        {"role": "system", "content": request.system_prompt},
+        {
+            "role": "system",
+            "content": f"{request.system_prompt}\n\n{MEDICAL_IMAGE_INSTRUCTIONS}",
+        },
         {"role": "user", "content": request.prompt},
     ]
     return {"response": _call_llm(messages, ollama_model="llama3")}
@@ -1094,7 +1185,10 @@ def analyze_images(request: ImageAnalysisRequest) -> dict[str, str]:
             [
                 {
                     "role": "system",
-                    "content": "Analyze the supplied images and answer accurately. State uncertainty.",
+                    "content": (
+                        "Analyze the supplied images and answer accurately. State uncertainty. "
+                        f"{MEDICAL_IMAGE_INSTRUCTIONS}"
+                    ),
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -1108,7 +1202,10 @@ def analyze_images(request: ImageAnalysisRequest) -> dict[str, str]:
         messages = [
             {
                 "role": "system",
-                "content": "Analyze the supplied images and answer accurately. State uncertainty.",
+                "content": (
+                    "Analyze the supplied images and answer accurately. State uncertainty. "
+                    f"{MEDICAL_IMAGE_INSTRUCTIONS}"
+                ),
             },
             {"role": "user", "content": prompt, "images": encoded_images},
         ]
@@ -1129,7 +1226,10 @@ def analyze_images(request: ImageAnalysisRequest) -> dict[str, str]:
             [
                 {
                     "role": "system",
-                    "content": "Analyze the supplied images and answer accurately. State uncertainty.",
+                    "content": (
+                        "Analyze the supplied images and answer accurately. State uncertainty. "
+                        f"{MEDICAL_IMAGE_INSTRUCTIONS}"
+                    ),
                 },
                 {"role": "user", "content": content},
             ],

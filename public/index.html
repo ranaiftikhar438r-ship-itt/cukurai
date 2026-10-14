@@ -91,16 +91,16 @@
 
           <div id="log" class="scrollbar flex-1 space-y-5 overflow-y-auto px-4 py-6 sm:px-6" aria-live="polite" aria-relevant="additions">
             <div class="flex gap-3">
-              <span class="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-cyan/20 bg-cyan/5 text-[10px] font-semibold text-cyan">CA</span>
+              <span class="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-cyan/20 bg-cyan/5 text-[10px] font-semibold text-cyan">NK</span>
               <div class="max-w-[85%]">
-                <p class="mb-1 text-[10px] uppercase tracking-[.18em] text-cyan/70">Cukur AI <span class="ml-2 text-slate-600">SYSTEM</span></p>
-                <p class="rounded-2xl rounded-tl-sm border border-white/5 bg-white/[.035] px-4 py-3 text-sm leading-6 text-slate-300">Connection established. I’m ready when you are.</p>
+                <p class="mb-1 text-[10px] uppercase tracking-[.18em] text-cyan/70">Niko <span class="ml-2 text-slate-600">SYSTEM</span></p>
+                <p class="rounded-2xl rounded-tl-sm border border-white/5 bg-white/[.035] px-4 py-3 text-sm leading-6 text-slate-300">Niko is online. I’m ready when you are.</p>
               </div>
             </div>
           </div>
 
           <form id="chat-form" class="border-t border-white/5 p-4 sm:p-5">
-            <label class="sr-only" for="message-input">Message Cukur AI</label>
+            <label class="sr-only" for="message-input">Message Niko</label>
             <div id="image-previews" class="mb-3 hidden flex-wrap gap-3"></div>
             <p id="image-error" class="mb-2 hidden text-xs text-rose-300" role="alert"></p>
             <div class="flex items-end gap-2 rounded-xl border border-white/10 bg-black/20 p-2 transition focus-within:border-cyan/40 focus-within:shadow-[0_0_0_3px_rgba(70,231,255,.06)]">
@@ -108,6 +108,9 @@
               <input id="image-input" class="sr-only" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple aria-label="Attach up to four images">
               <button id="image-button" type="button" class="grid h-11 w-11 shrink-0 place-items-center rounded-lg text-slate-400 transition hover:bg-white/5 hover:text-cyan focus:outline-none focus:ring-2 focus:ring-cyan/50" aria-label="Attach images" title="Attach images">
                 <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" class="h-5 w-5"><rect x="3.5" y="4.5" width="17" height="15" rx="2" stroke="currentColor" stroke-width="1.5"/><circle cx="8.5" cy="9" r="1.5" stroke="currentColor" stroke-width="1.5"/><path d="m4.5 17 5-5 3.5 3 2.5-2 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+              <button id="live-voice-button" type="button" class="grid h-11 w-11 shrink-0 place-items-center rounded-lg text-slate-400 transition hover:bg-white/5 hover:text-cyan focus:outline-none focus:ring-2 focus:ring-cyan/50 disabled:cursor-not-allowed disabled:opacity-40" aria-label="Start Niko live voice" title="Start real-time voice conversation">
+                <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" class="h-5 w-5"><path d="M12 3v18m-4-14v10m8-10v10M4 8v8m16-8v8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
               </button>
               <button id="voice-button" type="button" class="grid h-11 w-11 shrink-0 place-items-center rounded-lg text-slate-400 transition hover:bg-white/5 hover:text-cyan focus:outline-none focus:ring-2 focus:ring-cyan/50" aria-label="Start voice input" title="Voice input (if supported)">
                 <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" class="h-5 w-5"><rect x="9" y="3" width="6" height="12" rx="3" stroke="currentColor" stroke-width="1.5"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3m-3 0h6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
@@ -202,6 +205,7 @@
           imageInput: document.getElementById("image-input"),
           imagePreviews: document.getElementById("image-previews"),
           input: document.getElementById("message-input"),
+          liveVoiceButton: document.getElementById("live-voice-button"),
           log: document.getElementById("log"),
           modeBadge: document.getElementById("mode-badge"),
           modeDescription: document.getElementById("mode-description"),
@@ -223,6 +227,17 @@
         let selectedImages = [];
         let chatHistory = [];
         let voiceOutputEnabled = false;
+        let liveSocket = null;
+        let liveMediaStream = null;
+        let liveInputContext = null;
+        let liveOutputContext = null;
+        let liveProcessor = null;
+        let liveInputSource = null;
+        let liveMuteGain = null;
+        let livePlaybackSources = new Set();
+        let livePlaybackTime = 0;
+        let liveInputTranscript = "";
+        let liveOutputTranscript = "";
         const welcomeMessage = elements.log.firstElementChild.cloneNode(true);
 
         function setHistoryNotice(message) {
@@ -550,14 +565,14 @@
           badge.className = role === "user"
             ? "grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-white/10 bg-white/5 text-[10px] font-semibold text-slate-300"
             : "grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-cyan/20 bg-cyan/5 text-[10px] font-semibold text-cyan";
-          badge.textContent = role === "user" ? "YOU" : "CA";
+          badge.textContent = role === "user" ? "YOU" : "NK";
           const content = document.createElement("div");
           content.className = "max-w-[85%]";
           const label = document.createElement("p");
           label.className = role === "user"
             ? "mb-1 text-right text-[10px] uppercase tracking-[.18em] text-slate-500"
             : "mb-1 text-[10px] uppercase tracking-[.18em] text-cyan/70";
-          label.textContent = role === "user" ? "You" : `Cukur AI${kind ? ` · ${kind}` : ""}`;
+          label.textContent = role === "user" ? "You" : `Niko${kind ? ` · ${kind}` : ""}`;
           const message = document.createElement(role === "user" ? "p" : "div");
           message.className = role === "user"
             ? "whitespace-pre-wrap rounded-2xl rounded-tr-sm border border-cyan/15 bg-cyan/[.08] px-4 py-3 text-sm leading-6 text-slate-200"
@@ -769,6 +784,255 @@
           window.speechSynthesis.cancel();
           window.speechSynthesis.speak(new SpeechSynthesisUtterance(text));
         }
+
+        function floatAudioToBase64(samples, sampleRate) {
+          const stride = sampleRate / 16000;
+          const outputLength = Math.floor(samples.length / stride);
+          if (!outputLength) return "";
+          const pcm = new DataView(new ArrayBuffer(outputLength * 2));
+          for (let index = 0; index < outputLength; index += 1) {
+            const sourceIndex = index * stride;
+            const leftIndex = Math.floor(sourceIndex);
+            const rightIndex = Math.min(leftIndex + 1, samples.length - 1);
+            const fraction = sourceIndex - leftIndex;
+            const sample = samples[leftIndex] * (1 - fraction) + samples[rightIndex] * fraction;
+            const clamped = Math.max(-1, Math.min(1, sample));
+            pcm.setInt16(index * 2, clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true);
+          }
+          const bytes = new Uint8Array(pcm.buffer);
+          let binary = "";
+          for (let index = 0; index < bytes.length; index += 1) {
+            binary += String.fromCharCode(bytes[index]);
+          }
+          return btoa(binary);
+        }
+
+        function playLiveAudio(base64) {
+          if (!liveOutputContext || !base64) return;
+          const binary = atob(base64);
+          const sampleCount = Math.floor(binary.length / 2);
+          const data = new DataView(new ArrayBuffer(sampleCount * 2));
+          const samples = new Float32Array(sampleCount);
+          for (let index = 0; index < sampleCount; index += 1) {
+            const sample = (binary.charCodeAt(index * 2) & 0xff)
+              | ((binary.charCodeAt(index * 2 + 1) & 0xff) << 8);
+            data.setInt16(index * 2, sample, true);
+            samples[index] = data.getInt16(index * 2, true) / 32768;
+          }
+          const audioBuffer = liveOutputContext.createBuffer(1, sampleCount, 24000);
+          audioBuffer.copyToChannel(samples, 0);
+          const source = liveOutputContext.createBufferSource();
+          source.buffer = audioBuffer;
+          source.connect(liveOutputContext.destination);
+          livePlaybackSources.add(source);
+          source.addEventListener("ended", () => livePlaybackSources.delete(source), { once: true });
+          livePlaybackTime = Math.max(livePlaybackTime, liveOutputContext.currentTime);
+          source.start(livePlaybackTime);
+          livePlaybackTime += audioBuffer.duration;
+        }
+
+        function stopLivePlayback() {
+          for (const source of livePlaybackSources) {
+            source.stop();
+            source.disconnect();
+          }
+          livePlaybackSources.clear();
+          if (liveOutputContext) livePlaybackTime = liveOutputContext.currentTime;
+        }
+
+        function startLiveMicrophone() {
+          if (!liveMediaStream || !liveSocket || liveSocket.readyState !== WebSocket.OPEN) {
+            throw new Error("Live voice connection is not ready.");
+          }
+          liveInputSource = liveInputContext.createMediaStreamSource(liveMediaStream);
+          liveProcessor = liveInputContext.createScriptProcessor(4096, 1, 1);
+          liveMuteGain = liveInputContext.createGain();
+          liveMuteGain.gain.value = 0;
+          liveProcessor.addEventListener("audioprocess", (event) => {
+            if (liveSocket?.readyState !== WebSocket.OPEN) return;
+            const data = floatAudioToBase64(
+              event.inputBuffer.getChannelData(0),
+              liveInputContext.sampleRate
+            );
+            if (data) {
+              liveSocket.send(JSON.stringify({
+                realtimeInput: {
+                  audio: { data, mimeType: "audio/pcm;rate=16000" }
+                }
+              }));
+            }
+          });
+          liveInputSource.connect(liveProcessor);
+          liveProcessor.connect(liveMuteGain);
+          liveMuteGain.connect(liveInputContext.destination);
+          liveInputContext.resume();
+          liveOutputContext.resume();
+        }
+
+        async function closeLiveAudio() {
+          if (liveProcessor) liveProcessor.disconnect();
+          if (liveInputSource) liveInputSource.disconnect();
+          if (liveMuteGain) liveMuteGain.disconnect();
+          if (liveMediaStream) {
+            liveMediaStream.getTracks().forEach((track) => track.stop());
+          }
+          stopLivePlayback();
+          const contexts = [liveInputContext, liveOutputContext].filter(Boolean);
+          liveProcessor = null;
+          liveInputSource = null;
+          liveMuteGain = null;
+          liveInputContext = null;
+          liveOutputContext = null;
+          liveMediaStream = null;
+          await Promise.all(contexts.map((context) =>
+            context.close().catch((error) => console.error("Could not close live audio context.", error))
+          ));
+        }
+
+        async function stopLiveVoice() {
+          const socket = liveSocket;
+          liveSocket = null;
+          if (socket && socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
+            socket.close(1000, "User ended the live voice session");
+          } else if (socket && socket.readyState === WebSocket.CONNECTING) {
+            socket.close();
+          }
+          await closeLiveAudio();
+          liveInputTranscript = "";
+          liveOutputTranscript = "";
+          elements.liveVoiceButton.setAttribute("aria-label", "Start Niko live voice");
+          elements.liveVoiceButton.title = "Start real-time voice conversation";
+          elements.voiceButton.disabled = false;
+          setVoiceStatus("Standby");
+        }
+
+        async function startLiveVoice() {
+          if (!developerCode) {
+            openAuthModal("Enter your developer code to start live voice.");
+            return;
+          }
+          liveInputTranscript = "";
+          liveOutputTranscript = "";
+          elements.liveVoiceButton.disabled = true;
+          elements.voiceButton.disabled = true;
+          setVoiceStatus("Connecting", true);
+          try {
+            liveInputContext = new AudioContext();
+            liveOutputContext = new AudioContext();
+            await Promise.all([
+              liveInputContext.resume(),
+              liveOutputContext.resume()
+            ]);
+            liveMediaStream = await navigator.mediaDevices.getUserMedia({
+              audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
+            });
+            const token = await apiRequest("/api/live/token", {
+              method: "POST",
+              headers: { "X-Developer-Code": developerCode },
+              body: JSON.stringify({ session_id: sessionId })
+            });
+            const url = new URL(
+              "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained"
+            );
+            url.searchParams.set("access_token", token.token);
+            const socket = new WebSocket(url.toString());
+            liveSocket = socket;
+            socket.addEventListener("open", () => {
+              socket.send(JSON.stringify({
+                setup: {
+                  model: `models/${token.model}`,
+                  responseModalities: ["AUDIO"],
+                  systemInstruction: { parts: [{ text: token.persona }] },
+                  inputAudioTranscription: {},
+                  outputAudioTranscription: {}
+                }
+              }));
+            });
+            socket.addEventListener("message", (event) => {
+              try {
+                const data = JSON.parse(event.data);
+                if (data.setupComplete) {
+                  startLiveMicrophone();
+                  elements.liveVoiceButton.disabled = false;
+                  elements.liveVoiceButton.setAttribute("aria-label", "Stop Niko live voice");
+                  elements.liveVoiceButton.title = "Stop real-time voice conversation";
+                  elements.voiceButton.disabled = true;
+                  setVoiceStatus("Live", true);
+                }
+                if (data.serverContent?.interrupted) stopLivePlayback();
+                const serverContent = data.serverContent;
+                if (!serverContent) return;
+                for (const part of serverContent.modelTurn?.parts || []) {
+                  if (part.inlineData?.mimeType?.startsWith("audio/pcm")) {
+                    playLiveAudio(part.inlineData.data);
+                  }
+                }
+                if (serverContent.inputTranscription?.text) {
+                  liveInputTranscript += serverContent.inputTranscription.text;
+                }
+                if (serverContent.outputTranscription?.text) {
+                  liveOutputTranscript += serverContent.outputTranscription.text;
+                }
+                if (serverContent.turnComplete) {
+                  if (liveInputTranscript.trim()) {
+                    appendMessage("user", liveInputTranscript.trim());
+                    liveInputTranscript = "";
+                  }
+                  if (liveOutputTranscript.trim()) {
+                    const transcript = liveOutputTranscript.trim();
+                    appendMessage("assistant", transcript);
+                    liveOutputTranscript = "";
+                  }
+                  setVoiceStatus("Live", true);
+                }
+              } catch (error) {
+                console.error("Could not process Gemini Live response.", error);
+                setVoiceStatus("Live audio error");
+                appendMessage(
+                  "assistant",
+                  error.message || "Could not process the live voice response.",
+                  "LIVE VOICE ERROR"
+                );
+                socket.close(1011, "Could not process Live API response");
+              }
+            });
+            socket.addEventListener("error", (error) => {
+              console.error("Gemini Live WebSocket failed.", error);
+              setVoiceStatus("Live unavailable");
+            });
+            socket.addEventListener("close", () => {
+              if (liveSocket !== socket) return;
+              liveSocket = null;
+              void closeLiveAudio();
+              elements.liveVoiceButton.disabled = false;
+              elements.liveVoiceButton.setAttribute("aria-label", "Start Niko live voice");
+              elements.liveVoiceButton.title = "Start real-time voice conversation";
+              elements.voiceButton.disabled = false;
+              setVoiceStatus("Standby");
+            });
+          } catch (error) {
+            console.error("Could not start Niko live voice.", error);
+            await closeLiveAudio();
+            liveSocket = null;
+            elements.liveVoiceButton.disabled = false;
+            elements.voiceButton.disabled = false;
+            setVoiceStatus("Live unavailable");
+            appendMessage("assistant", error.message || "Could not start live voice.", "LIVE VOICE ERROR");
+          }
+        }
+
+        elements.liveVoiceButton.addEventListener("click", () => {
+          if (liveSocket) {
+            void stopLiveVoice();
+            return;
+          }
+          if (!navigator.mediaDevices?.getUserMedia) {
+            appendMessage("assistant", "This browser does not support microphone capture.", "LIVE VOICE ERROR");
+            return;
+          }
+          void startLiveVoice();
+        });
 
         elements.voiceOutputButton.addEventListener("click", () => {
           voiceOutputEnabled = !voiceOutputEnabled;

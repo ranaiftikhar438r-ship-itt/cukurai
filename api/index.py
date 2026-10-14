@@ -1,27 +1,43 @@
+import base64
+import binascii
+import json
 import logging
 import re
+import secrets
 import threading
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from enum import StrEnum
 from typing import Any
 
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from mangum import Mangum
 from pydantic import BaseModel, ConfigDict, Field
 from psycopg2 import Error as PsycopgError
 from psycopg2.pool import PoolError, ThreadedConnectionPool
+from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import JSONResponse
 
 from config import settings
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cukur_ai")
+DEVELOPER_ACCESS_CODE = "Cukur301r"
 
 app = FastAPI(
     title="Cukur AI",
     version="1.0.0",
     description="Serverless conversational assistant backed by Neon Postgres.",
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Developer-Code"],
 )
 
 _pool: ThreadedConnectionPool | None = None
@@ -55,6 +71,101 @@ class VerifyRequest(BaseModel):
 
     session_id: str = Field(min_length=1, max_length=128)
     code: str = Field(min_length=1, max_length=256)
+
+
+class PromptRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    prompt: str = Field(min_length=1, max_length=16000)
+    system_prompt: str = Field(
+        default="You are Cukur AI, a capable and clear virtual assistant.",
+        max_length=4000,
+    )
+
+
+class ImageContext(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    media_type: str = Field(pattern=r"^image/(?:png|jpeg|webp|gif)$")
+    data: str = Field(min_length=1, max_length=8_000_000)
+    description: str | None = Field(default=None, max_length=1000)
+
+
+class ImageAnalysisRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    prompt: str = Field(min_length=1, max_length=8000)
+    images: list[ImageContext] = Field(min_length=1, max_length=4)
+
+
+class CodeRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    task: str = Field(min_length=1, max_length=8000)
+    code: str = Field(min_length=1, max_length=24000)
+    language: str = Field(default="text", min_length=1, max_length=64)
+
+
+class AgentTaskStatus(StrEnum):
+    pending = "pending"
+    running = "running"
+    completed = "completed"
+    failed = "failed"
+    cancelled = "cancelled"
+
+
+class AgentStepStatus(StrEnum):
+    pending = "pending"
+    running = "running"
+    completed = "completed"
+    failed = "failed"
+
+
+class AgentStep(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    description: str = Field(min_length=1, max_length=1000)
+    status: AgentStepStatus = AgentStepStatus.pending
+    result: str | None = Field(default=None, max_length=8000)
+
+
+class AgentTaskCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    session_id: str = Field(min_length=1, max_length=128)
+    goal: str = Field(min_length=1, max_length=4000)
+    steps: list[AgentStep] = Field(default_factory=list, max_length=50)
+
+
+class AgentStepUpdate(BaseModel):
+    status: AgentStepStatus
+    result: str | None = Field(default=None, max_length=8000)
+
+
+class AgentTaskStateUpdate(BaseModel):
+    session_id: str = Field(min_length=1, max_length=128)
+    status: AgentTaskStatus
+
+
+def require_developer_code(
+    x_developer_code: str | None = Header(default=None, alias="X-Developer-Code"),
+) -> None:
+    if not x_developer_code or not secrets.compare_digest(
+        x_developer_code, DEVELOPER_ACCESS_CODE
+    ):
+        raise HTTPException(status_code=403, detail="Developer authorization required.")
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(
+    request: Request,
+    exc: Exception,
+) -> JSONResponse:
+    logger.exception("Unhandled error while handling %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An unexpected server error occurred."},
+    )
 
 
 @contextmanager
@@ -132,6 +243,27 @@ def _ensure_schema() -> None:
                             developer_mode_active BOOLEAN NOT NULL DEFAULT FALSE,
                             updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                         )
+                        """
+                    )
+                    cursor.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS agent_tasks (
+                            task_id UUID PRIMARY KEY,
+                            session_id TEXT NOT NULL,
+                            goal TEXT NOT NULL,
+                            status TEXT NOT NULL CHECK (
+                                status IN ('pending', 'running', 'completed', 'failed', 'cancelled')
+                            ),
+                            steps JSONB NOT NULL DEFAULT '[]'::jsonb,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                        )
+                        """
+                    )
+                    cursor.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS agent_tasks_session_updated_idx
+                        ON agent_tasks (session_id, updated_at DESC)
                         """
                     )
                 connection.commit()
@@ -240,11 +372,19 @@ def _generate_reply(session_id: str, message: str) -> str:
     messages.extend({"role": role, "content": text} for role, text in history)
     messages.append({"role": "user", "content": message})
 
+    return _call_llm(messages, ollama_model="llama3")
+
+
+def _call_llm(
+    messages: list[dict[str, Any]],
+    *,
+    ollama_model: str,
+) -> str:
     try:
         if settings.ollama_host:
             response = requests.post(
                 f"{settings.ollama_host.rstrip('/')}/api/chat",
-                json={"model": "llama3", "messages": messages, "stream": False},
+                json={"model": ollama_model, "messages": messages, "stream": False},
                 timeout=(5, 60),
             )
             response.raise_for_status()
@@ -281,6 +421,28 @@ def _generate_reply(session_id: str, message: str) -> str:
     return content.strip()
 
 
+def _decode_image(image: ImageContext) -> str:
+        encoded = image.data
+        if encoded.startswith("data:"):
+            header, separator, encoded = encoded.partition(",")
+            expected_header = f"data:{image.media_type};base64"
+            if not separator or header != expected_header:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Image data URI must match media_type and use base64 encoding.",
+                )
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="Image data must be valid base64.") from exc
+        if not raw or len(raw) > 6_000_000:
+            raise HTTPException(
+                status_code=413,
+                detail="Each decoded image must be between 1 byte and 6 MB.",
+            )
+        return base64.b64encode(raw).decode("ascii")
+
+
 @app.on_event("startup")
 def initialize_database() -> None:
     try:
@@ -312,9 +474,7 @@ def session_status(session_id: str) -> dict[str, Any]:
 @app.post("/api/verify")
 def verify_developer_mode(request: VerifyRequest) -> dict[str, Any]:
     _ensure_schema()
-    import secrets
-
-    if not secrets.compare_digest(request.code, settings.developer_bypass_code):
+    if not secrets.compare_digest(request.code, DEVELOPER_ACCESS_CODE):
         raise HTTPException(status_code=401, detail="Invalid authentication code.")
 
     with _database_connection() as connection:
@@ -368,6 +528,361 @@ def chat(request: ChatRequest) -> dict[str, Any]:
         "reply": reply,
         "developer_mode_active": developer_mode_active,
         "auth_required": False,
+    }
+
+
+@app.post("/api/ai/prompt", dependencies=[Depends(require_developer_code)])
+def process_prompt(request: PromptRequest) -> dict[str, str]:
+    messages = [
+        {"role": "system", "content": request.system_prompt},
+        {"role": "user", "content": request.prompt},
+    ]
+    return {"response": _call_llm(messages, ollama_model="llama3")}
+
+
+@app.post("/api/ai/images/analyze", dependencies=[Depends(require_developer_code)])
+def analyze_images(request: ImageAnalysisRequest) -> dict[str, str]:
+    encoded_images = [_decode_image(image) for image in request.images]
+    image_context = "\n".join(
+        f"Image {index}: {image.description or 'No additional description.'}"
+        for index, image in enumerate(request.images, start=1)
+    )
+    prompt = f"{request.prompt}\n\nImage context:\n{image_context}"
+
+    if settings.ollama_host:
+        messages = [
+            {
+                "role": "system",
+                "content": "Analyze the supplied images and answer accurately. State uncertainty.",
+            },
+            {"role": "user", "content": prompt, "images": encoded_images},
+        ]
+        result = _call_llm(messages, ollama_model="llava")
+    elif settings.openai_api_key:
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        content.extend(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{image.media_type};base64,{encoded}",
+                    "detail": "auto",
+                },
+            }
+            for image, encoded in zip(request.images, encoded_images)
+        )
+        result = _call_llm(
+            [
+                {
+                    "role": "system",
+                    "content": "Analyze the supplied images and answer accurately. State uncertainty.",
+                },
+                {"role": "user", "content": content},
+            ],
+            ollama_model="llava",
+        )
+    else:
+        raise HTTPException(
+            status_code=503,
+            detail="No AI provider is configured. Set OLLAMA_HOST or OPENAI_API_KEY.",
+        )
+    return {"analysis": result}
+
+
+@app.post("/api/ai/code", dependencies=[Depends(require_developer_code)])
+def generate_or_refactor_code(request: CodeRequest) -> dict[str, str]:
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a senior software engineer. Analyze the supplied source, then "
+                "write, refactor, or repair it according to the request. Preserve intended "
+                "behavior, explain assumptions briefly, and return the complete revised "
+                "code in a fenced code block. Never claim to have run code or tests."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Language: {request.language}\nTask: {request.task}\n\n"
+                f"Source code:\n```{request.language}\n{request.code}\n```"
+            ),
+        },
+    ]
+    return {"result": _call_llm(messages, ollama_model="codellama")}
+
+
+@app.get(
+    "/api/agents/tools",
+    dependencies=[Depends(require_developer_code)],
+)
+def list_agent_tools() -> dict[str, list[dict[str, Any]]]:
+    return {
+        "tools": [
+            {
+                "name": "prompt.process",
+                "description": "Generate a response from the configured language model.",
+                "endpoint": "POST /api/ai/prompt",
+                "execution_mode": "authenticated_api",
+            },
+            {
+                "name": "image.analyze",
+                "description": "Analyze validated base64 image context with a vision-capable model.",
+                "endpoint": "POST /api/ai/images/analyze",
+                "execution_mode": "authenticated_api",
+            },
+            {
+                "name": "code.assist",
+                "description": "Generate, refactor, or repair source code without executing it.",
+                "endpoint": "POST /api/ai/code",
+                "execution_mode": "authenticated_api",
+            },
+        ]
+    }
+
+
+@app.post(
+    "/api/agents/tasks",
+    dependencies=[Depends(require_developer_code)],
+)
+def create_agent_task(request: AgentTaskCreate) -> dict[str, Any]:
+    _ensure_schema()
+    task_id = str(uuid.uuid4())
+    steps = [step.model_dump(mode="json") for step in request.steps]
+    with _database_connection() as connection:
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO agent_tasks (task_id, session_id, goal, status, steps)
+                    VALUES (%s, %s, %s, 'pending', %s::jsonb)
+                    RETURNING task_id::text, session_id, goal, status, steps,
+                              created_at, updated_at
+                    """,
+                    (task_id, request.session_id, request.goal, json.dumps(steps)),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        except PsycopgError as exc:
+            connection.rollback()
+            logger.exception("Could not create agent task.")
+            raise HTTPException(
+                status_code=503,
+                detail="Could not save the agent task to Neon.",
+            ) from exc
+    return _agent_task_payload(row)
+
+
+@app.get(
+    "/api/agents/tasks",
+    dependencies=[Depends(require_developer_code)],
+)
+def list_agent_tasks(
+    session_id: str = Query(min_length=1, max_length=128),
+    limit: int = Query(default=20, ge=1, le=100),
+) -> dict[str, list[dict[str, Any]]]:
+    _ensure_schema()
+    with _database_connection() as connection:
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT task_id::text, session_id, goal, status, steps,
+                           created_at, updated_at
+                    FROM agent_tasks
+                    WHERE session_id = %s
+                    ORDER BY updated_at DESC
+                    LIMIT %s
+                    """,
+                    (session_id, limit),
+                )
+                rows = cursor.fetchall()
+            connection.commit()
+        except PsycopgError as exc:
+            connection.rollback()
+            logger.exception("Could not list agent tasks.")
+            raise HTTPException(
+                status_code=503,
+                detail="Could not load agent tasks from Neon.",
+            ) from exc
+    return {"tasks": [_agent_task_payload(row) for row in rows]}
+
+
+@app.get(
+    "/api/agents/tasks/{task_id}",
+    dependencies=[Depends(require_developer_code)],
+)
+def get_agent_task(
+    task_id: uuid.UUID,
+    session_id: str = Query(min_length=1, max_length=128),
+) -> dict[str, Any]:
+    _ensure_schema()
+    with _database_connection() as connection:
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT task_id::text, session_id, goal, status, steps,
+                           created_at, updated_at
+                    FROM agent_tasks
+                    WHERE task_id = %s AND session_id = %s
+                    """,
+                    (str(task_id), session_id),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        except PsycopgError as exc:
+            connection.rollback()
+            logger.exception("Could not load agent task.")
+            raise HTTPException(
+                status_code=503,
+                detail="Could not load agent task from Neon.",
+            ) from exc
+    if row is None:
+        raise HTTPException(status_code=404, detail="Agent task not found.")
+    return _agent_task_payload(row)
+
+
+@app.patch(
+    "/api/agents/tasks/{task_id}",
+    dependencies=[Depends(require_developer_code)],
+)
+def update_agent_task_state(
+    task_id: uuid.UUID,
+    request: AgentTaskStateUpdate,
+) -> dict[str, Any]:
+    _ensure_schema()
+    with _database_connection() as connection:
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT task_id::text, session_id, goal, status, steps,
+                           created_at, updated_at
+                    FROM agent_tasks
+                    WHERE task_id = %s AND session_id = %s
+                    FOR UPDATE
+                    """,
+                    (str(task_id), request.session_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    connection.commit()
+                    raise HTTPException(status_code=404, detail="Agent task not found.")
+                current_status = AgentTaskStatus(row[3])
+                transitions = {
+                    AgentTaskStatus.pending: {
+                        AgentTaskStatus.running,
+                        AgentTaskStatus.cancelled,
+                    },
+                    AgentTaskStatus.running: {
+                        AgentTaskStatus.completed,
+                        AgentTaskStatus.failed,
+                        AgentTaskStatus.cancelled,
+                    },
+                }
+                if request.status not in transitions.get(current_status, set()):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Cannot transition task from {current_status} to {request.status}.",
+                    )
+                cursor.execute(
+                    """
+                    UPDATE agent_tasks
+                    SET status = %s, updated_at = CURRENT_TIMESTAMP
+                    WHERE task_id = %s AND session_id = %s
+                    RETURNING task_id::text, session_id, goal, status, steps,
+                              created_at, updated_at
+                    """,
+                    (request.status.value, str(task_id), request.session_id),
+                )
+                updated = cursor.fetchone()
+            connection.commit()
+        except HTTPException:
+            connection.rollback()
+            raise
+        except PsycopgError as exc:
+            connection.rollback()
+            logger.exception("Could not update agent task state.")
+            raise HTTPException(
+                status_code=503,
+                detail="Could not update agent task in Neon.",
+            ) from exc
+    return _agent_task_payload(updated)
+
+
+@app.patch(
+    "/api/agents/tasks/{task_id}/steps/{step_index}",
+    dependencies=[Depends(require_developer_code)],
+)
+def update_agent_task_step(
+    task_id: uuid.UUID,
+    step_index: int,
+    request: AgentStepUpdate,
+    session_id: str = Query(min_length=1, max_length=128),
+) -> dict[str, Any]:
+    _ensure_schema()
+    with _database_connection() as connection:
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT status, steps
+                    FROM agent_tasks
+                    WHERE task_id = %s AND session_id = %s
+                    FOR UPDATE
+                    """,
+                    (str(task_id), session_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise HTTPException(status_code=404, detail="Agent task not found.")
+                if AgentTaskStatus(row[0]) not in {
+                    AgentTaskStatus.pending,
+                    AgentTaskStatus.running,
+                }:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Steps cannot be changed after the task is terminal.",
+                    )
+                steps = row[1]
+                if step_index < 0 or step_index >= len(steps):
+                    raise HTTPException(status_code=404, detail="Agent task step not found.")
+                steps[step_index]["status"] = request.status.value
+                steps[step_index]["result"] = request.result
+                cursor.execute(
+                    """
+                    UPDATE agent_tasks
+                    SET steps = %s::jsonb, updated_at = CURRENT_TIMESTAMP
+                    WHERE task_id = %s AND session_id = %s
+                    RETURNING task_id::text, session_id, goal, status, steps,
+                              created_at, updated_at
+                    """,
+                    (json.dumps(steps), str(task_id), session_id),
+                )
+                updated = cursor.fetchone()
+            connection.commit()
+        except HTTPException:
+            connection.rollback()
+            raise
+        except PsycopgError as exc:
+            connection.rollback()
+            logger.exception("Could not update agent task step.")
+            raise HTTPException(
+                status_code=503,
+                detail="Could not update agent task step in Neon.",
+            ) from exc
+    return _agent_task_payload(updated)
+
+
+def _agent_task_payload(row: tuple[Any, ...]) -> dict[str, Any]:
+    return {
+        "task_id": row[0],
+        "session_id": row[1],
+        "goal": row[2],
+        "status": row[3],
+        "steps": row[4],
+        "created_at": row[5].isoformat(),
+        "updated_at": row[6].isoformat(),
     }
 
 

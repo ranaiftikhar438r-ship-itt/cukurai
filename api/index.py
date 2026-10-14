@@ -34,6 +34,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("cukur_ai")
 DEVELOPER_MODE_CODE = "Cukur301r"
 GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL_FALLBACK = "gemini-2.5-flash-lite"
+GEMINI_MODELS = (GEMINI_MODEL, GEMINI_MODEL_FALLBACK)
 GEMINI_LIVE_MODEL = "gemini-3.8-live"
 NIKO_PERSONA_INSTRUCTIONS = (
     "You are Niko, a highly analytical, observant, and dependable conversational "
@@ -57,6 +59,17 @@ MEDICAL_IMAGE_INSTRUCTIONS = (
     "general only and append exactly: 'Consult a licensed medical professional before "
     "making any health decisions.'"
 )
+
+
+def _is_gemini_model_not_found(exc: genai_errors.ClientError) -> bool:
+    if exc.code != 404:
+        return False
+    error_detail = str(exc).lower()
+    return "model" in error_detail and any(
+        phrase in error_detail
+        for phrase in ("not found", "not_found", "does not exist", "unsupported")
+    )
+
 
 app = FastAPI(
     title="Cukur AI",
@@ -538,41 +551,58 @@ def _call_gemini(
     system_instruction = "\n".join(part["text"] for part in system_parts) or None
     client: genai.Client | None = None
     try:
-        config = genai_types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
+        configs = (
+            genai_types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
+            ),
+            genai_types.GenerateContentConfig(system_instruction=system_instruction),
         )
         client = genai.Client(api_key=api_key)
-        try:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=contents,
-                config=config,
-            )
-        except genai_errors.ClientError as exc:
-            error_detail = str(exc).lower()
-            is_search_tool_error = exc.code == 400 and any(
-                marker in error_detail
-                for marker in ("google_search", "google search", "grounding", "tool")
-            )
-            if not is_search_tool_error:
-                raise
-            logger.warning("Gemini rejected Google Search grounding; retrying without it.")
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=contents,
-                config=genai_types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                ),
+        response = None
+        for model_index, model in enumerate(GEMINI_MODELS):
+            for config_index, config in enumerate(configs):
+                try:
+                    response = client.models.generate_content(
+                        model=model,
+                        contents=contents,
+                        config=config,
+                    )
+                    break
+                except genai_errors.ClientError as exc:
+                    error_detail = str(exc).lower()
+                    is_search_tool_error = exc.code == 400 and any(
+                        marker in error_detail
+                        for marker in ("google_search", "google search", "grounding", "tool")
+                    )
+                    if config_index == 0 and is_search_tool_error:
+                        logger.warning(
+                            "Gemini rejected Google Search grounding; retrying without it."
+                        )
+                        continue
+                    if model_index == 0 and _is_gemini_model_not_found(exc):
+                        logger.warning(
+                            "Gemini model %s was not found; retrying with %s.",
+                            model,
+                            GEMINI_MODEL_FALLBACK,
+                        )
+                        break
+                    raise
+            if response is not None:
+                break
+        if response is None:
+            raise HTTPException(
+                status_code=502,
+                detail="Gemini models were unavailable. Check API access and try again.",
             )
     except genai_errors.APIError as exc:
         status_code = exc.code
-        logger.exception("Gemini rejected the request with HTTP %s.", status_code)
+        logger.error("Gemini rejected the request with HTTP %s: %s", status_code, exc)
+        provider_detail = exc.message or "Gemini rejected the configured models."
         raise HTTPException(
             status_code=502,
             detail=(
-                f"Gemini rejected the request (HTTP {status_code}). "
-                "Check the Gemini API key, model, and request configuration."
+                f"Gemini rejected the request (HTTP {status_code}): {provider_detail}"
             ),
         ) from exc
     except (
@@ -705,32 +735,49 @@ def _stream_gemini_completion(
     grounding_metadata: Any = None
     try:
         client = genai.Client(api_key=api_key)
-        for config_index, config in enumerate(configs):
-            try:
-                for chunk in client.models.generate_content_stream(
-                    model=GEMINI_MODEL,
-                    contents=contents,
-                    config=config,
-                ):
-                    candidates = chunk.candidates or []
-                    if candidates and candidates[0].grounding_metadata:
-                        grounding_metadata = candidates[0].grounding_metadata
-                    text = chunk.text
-                    if isinstance(text, str) and text:
-                        response_text.append(text)
-                        yield text
-                break
-            except genai_errors.ClientError as exc:
-                error_detail = str(exc).lower()
-                is_search_tool_error = exc.code == 400 and any(
-                    marker in error_detail
-                    for marker in ("google_search", "google search", "grounding", "tool")
-                )
-                if config_index != 0 or not is_search_tool_error or response_text:
+        stream_completed = False
+        for model_index, model in enumerate(GEMINI_MODELS):
+            for config_index, config in enumerate(configs):
+                try:
+                    for chunk in client.models.generate_content_stream(
+                        model=model,
+                        contents=contents,
+                        config=config,
+                    ):
+                        candidates = chunk.candidates or []
+                        if candidates and candidates[0].grounding_metadata:
+                            grounding_metadata = candidates[0].grounding_metadata
+                        text = chunk.text
+                        if isinstance(text, str) and text:
+                            response_text.append(text)
+                            yield text
+                    stream_completed = True
+                    break
+                except genai_errors.ClientError as exc:
+                    error_detail = str(exc).lower()
+                    is_search_tool_error = exc.code == 400 and any(
+                        marker in error_detail
+                        for marker in ("google_search", "google search", "grounding", "tool")
+                    )
+                    if config_index == 0 and is_search_tool_error and not response_text:
+                        logger.warning(
+                            "Gemini rejected Google Search grounding; retrying stream without it."
+                        )
+                        continue
+                    if (
+                        model_index == 0
+                        and not response_text
+                        and _is_gemini_model_not_found(exc)
+                    ):
+                        logger.warning(
+                            "Gemini streaming model %s was not found; retrying with %s.",
+                            model,
+                            GEMINI_MODEL_FALLBACK,
+                        )
+                        break
                     raise
-                logger.warning(
-                    "Gemini rejected Google Search grounding; retrying stream without it."
-                )
+            if stream_completed:
+                break
         if not "".join(response_text).strip():
             logger.error("Gemini returned an empty streamed response.")
             raise HTTPException(
@@ -768,10 +815,13 @@ def _stream_gemini_completion(
     except HTTPException:
         raise
     except genai_errors.APIError as exc:
-        logger.exception("Gemini streaming request failed with HTTP %s.", exc.code)
+        logger.error("Gemini streaming request failed with HTTP %s: %s", exc.code, exc)
         raise HTTPException(
             status_code=502,
-            detail=f"Gemini rejected the request (HTTP {exc.code}). Check model and API key.",
+            detail=(
+                f"Gemini rejected the request (HTTP {exc.code}): "
+                f"{exc.message or 'Gemini rejected the configured models.'}"
+            ),
         ) from exc
     except (ValueError, TypeError, AttributeError) as exc:
         logger.exception("Gemini streaming request returned an invalid response.")

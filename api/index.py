@@ -7,6 +7,7 @@ import threading
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -134,6 +135,14 @@ class AgentStepUpdate(BaseModel):
 class AgentTaskStateUpdate(BaseModel):
     session_id: str = Field(min_length=1, max_length=128)
     status: AgentTaskStatus
+
+
+@dataclass(frozen=True)
+class AICompletion:
+    text: str
+    grounding_metadata: dict[str, Any] | None = None
+    sources: list[dict[str, str]] | None = None
+    web_search_queries: list[str] | None = None
 
 
 def require_developer_code(
@@ -325,7 +334,7 @@ def _generate_reply(
     session_id: str,
     message: str,
     gemini_images: list[tuple[str, str]] | None = None,
-) -> str:
+) -> AICompletion:
     with _database_connection() as connection:
         try:
             with connection.cursor() as cursor:
@@ -362,7 +371,7 @@ def _generate_reply(
     messages.extend({"role": role, "content": text} for role, text in history)
     messages.append({"role": "user", "content": message})
 
-    return _call_llm(
+    return _call_llm_completion(
         messages,
         ollama_model="llama3",
         gemini_images=gemini_images,
@@ -375,6 +384,19 @@ def _call_llm(
     ollama_model: str,
     gemini_images: list[tuple[str, str]] | None = None,
 ) -> str:
+    return _call_llm_completion(
+        messages,
+        ollama_model=ollama_model,
+        gemini_images=gemini_images,
+    ).text
+
+
+def _call_llm_completion(
+    messages: list[dict[str, Any]],
+    *,
+    ollama_model: str,
+    gemini_images: list[tuple[str, str]] | None = None,
+) -> AICompletion:
     try:
         if gemini_images and not settings.gemini_api_key:
             raise HTTPException(
@@ -410,7 +432,14 @@ def _call_llm(
             )
     except HTTPException:
         raise
-    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
+    except (
+        requests.RequestException,
+        ValueError,
+        KeyError,
+        IndexError,
+        TypeError,
+        AttributeError,
+    ) as exc:
         logger.exception("The configured AI provider could not complete the request.")
         raise HTTPException(
             status_code=502,
@@ -423,14 +452,14 @@ def _call_llm(
             status_code=502,
             detail="The configured AI provider returned an empty response.",
         )
-    return content.strip()
+    return AICompletion(text=content.strip())
 
 
 def _call_gemini(
     messages: list[dict[str, Any]],
     *,
     gemini_images: list[tuple[str, str]] | None = None,
-) -> str:
+) -> AICompletion:
     api_key = settings.gemini_api_key
     if not api_key:
         raise HTTPException(status_code=503, detail="Gemini is not configured on this server.")
@@ -470,6 +499,7 @@ def _call_gemini(
     payload: dict[str, Any] = {"contents": contents}
     if system_parts:
         payload["systemInstruction"] = {"parts": system_parts}
+    payload["tools"] = [{"google_search": {}}]
 
     try:
         response = requests.post(
@@ -492,14 +522,57 @@ def _call_gemini(
                 status_code=502,
                 detail="Gemini did not return a response. Check the prompt and model configuration.",
             )
-        parts = candidates[0].get("content", {}).get("parts", [])
+        candidate = candidates[0]
+        if not isinstance(candidate, dict):
+            raise ValueError("Gemini response candidate must be a JSON object.")
+        parts = candidate.get("content", {}).get("parts", [])
         text = "\n".join(
             part["text"]
             for part in parts
             if isinstance(part, dict) and isinstance(part.get("text"), str)
         )
+        grounding_metadata = candidate.get("groundingMetadata")
+        if not isinstance(grounding_metadata, dict):
+            grounding_metadata = None
+        sources_by_uri: dict[str, dict[str, str]] = {}
+        if grounding_metadata:
+            grounding_chunks = grounding_metadata.get("groundingChunks", [])
+            if not isinstance(grounding_chunks, list):
+                grounding_chunks = []
+            for chunk in grounding_chunks:
+                if not isinstance(chunk, dict):
+                    continue
+                web_source = chunk.get("web")
+                if not isinstance(web_source, dict):
+                    continue
+                uri = web_source.get("uri")
+                title = web_source.get("title")
+                if (
+                    isinstance(uri, str)
+                    and uri.startswith(("https://", "http://"))
+                ):
+                    sources_by_uri[uri] = {
+                        "title": title if isinstance(title, str) and title else uri,
+                        "uri": uri,
+                    }
+        raw_queries = grounding_metadata.get("webSearchQueries", []) if grounding_metadata else []
+        web_search_queries = (
+            [query for query in raw_queries if isinstance(query, str)]
+            if isinstance(raw_queries, list)
+            else []
+        )
     except HTTPException:
         raise
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else "unknown"
+        logger.exception("Gemini rejected the request with HTTP %s.", status_code)
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Gemini rejected the request (HTTP {status_code}). "
+                "Check the Gemini API key, model, and request configuration."
+            ),
+        ) from exc
     except (
         requests.RequestException,
         ValueError,
@@ -517,7 +590,20 @@ def _call_gemini(
     if not text.strip():
         logger.error("Gemini returned an empty response.")
         raise HTTPException(status_code=502, detail="Gemini returned an empty response.")
-    return text.strip()
+    return AICompletion(
+        text=text.strip(),
+        grounding_metadata=grounding_metadata,
+        sources=list(sources_by_uri.values()),
+        web_search_queries=web_search_queries,
+    )
+
+
+def _completion_response_fields(completion: AICompletion) -> dict[str, Any]:
+    return {
+        "grounding_metadata": completion.grounding_metadata,
+        "sources": completion.sources or [],
+        "web_search_queries": completion.web_search_queries or [],
+    }
 
 
 def _decode_image(image: ImageContext) -> str:
@@ -644,7 +730,7 @@ def chat(
             detail="Combined image data must not exceed 3 MB before base64 encoding.",
         )
     if not settings.neon_database_url:
-        reply = _call_llm(
+        completion = _call_llm_completion(
             [
                 {
                     "role": "system",
@@ -661,26 +747,28 @@ def chat(
         )
         return {
             "session_id": request.session_id,
-            "reply": reply,
+            "reply": completion.text,
             "developer_mode_active": developer_mode_active,
             "auth_required": False,
             "persistence_enabled": False,
+            **_completion_response_fields(completion),
         }
 
     _ensure_schema()
-    reply = _generate_reply(request.session_id, request.message, gemini_images)
+    completion = _generate_reply(request.session_id, request.message, gemini_images)
     _save_messages(
         request.session_id,
         request.message,
-        reply,
+        completion.text,
         developer_mode_active,
     )
     return {
         "session_id": request.session_id,
-        "reply": reply,
+        "reply": completion.text,
         "developer_mode_active": developer_mode_active,
         "auth_required": False,
         "persistence_enabled": True,
+        **_completion_response_fields(completion),
     }
 
 

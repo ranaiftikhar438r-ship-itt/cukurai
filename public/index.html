@@ -64,9 +64,12 @@
             <span class="mt-1 block text-[10px] uppercase tracking-[.23em] text-muted">Secure assistant interface</span>
           </span>
         </a>
-        <div class="flex items-center gap-2 rounded-full border border-emerald-400/20 bg-emerald-400/5 px-3 py-2 text-xs text-emerald-300">
-          <span id="system-dot" class="h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_9px_#34d399]"></span>
-          <span id="system-label">System ready</span>
+        <div class="flex items-center gap-2">
+          <button id="clear-chat" type="button" class="rounded-lg border border-white/10 px-3 py-2 text-xs text-slate-400 transition hover:border-rose-400/30 hover:text-rose-300 focus:outline-none focus:ring-2 focus:ring-cyan/40">Clear chat</button>
+          <div class="flex items-center gap-2 rounded-full border border-emerald-400/20 bg-emerald-400/5 px-3 py-2 text-xs text-emerald-300">
+            <span id="system-dot" class="h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_9px_#34d399]"></span>
+            <span id="system-label">System ready</span>
+          </div>
         </div>
       </header>
 
@@ -178,6 +181,7 @@
         "use strict";
 
         const SESSION_STORAGE_KEY = "cukur-ai-session-id";
+        const CHAT_HISTORY_STORAGE_KEY = "cukur-ai-chat-history";
         const MAX_IMAGES = 4;
         const MAX_TOTAL_IMAGE_BYTES = 3 * 1024 * 1024;
         const sessionId = getSessionId();
@@ -188,6 +192,7 @@
           authSubmit: document.getElementById("auth-submit"),
           chatForm: document.getElementById("chat-form"),
           closeModal: document.getElementById("close-modal"),
+          clearChat: document.getElementById("clear-chat"),
           coreRing: document.getElementById("core-ring"),
           imageButton: document.getElementById("image-button"),
           imageError: document.getElementById("image-error"),
@@ -212,6 +217,89 @@
         let developerCode = null;
         let pendingMessage = null;
         let selectedImages = [];
+        let chatHistory = [];
+        const welcomeMessage = elements.log.firstElementChild.cloneNode(true);
+
+        function setHistoryNotice(message) {
+          elements.systemLabel.textContent = message;
+          elements.systemDot.classList.remove("bg-emerald-400", "bg-cyan");
+          elements.systemDot.classList.add("bg-rose-400");
+        }
+
+        function saveChatHistory() {
+          try {
+            localStorage.setItem(
+              `${CHAT_HISTORY_STORAGE_KEY}:${sessionId}`,
+              JSON.stringify(chatHistory)
+            );
+          } catch (error) {
+            console.error("Could not save chat history to localStorage.", error);
+            setHistoryNotice("History not saved");
+          }
+        }
+
+        function restoreChatHistory() {
+          let savedHistory;
+          try {
+            const stored = localStorage.getItem(`${CHAT_HISTORY_STORAGE_KEY}:${sessionId}`);
+            if (!stored) return;
+            savedHistory = JSON.parse(stored);
+          } catch (error) {
+            console.error("Could not read chat history from localStorage.", error);
+            setHistoryNotice("History unavailable");
+            return;
+          }
+          if (!Array.isArray(savedHistory)) {
+            console.error("Stored chat history has an invalid format.");
+            setHistoryNotice("History unavailable");
+            return;
+          }
+          chatHistory = savedHistory
+            .filter((entry) =>
+              entry
+              && (entry.role === "user" || entry.role === "assistant")
+              && typeof entry.text === "string"
+            )
+            .map((entry) => ({
+              role: entry.role,
+              text: entry.text,
+              kind: typeof entry.kind === "string" ? entry.kind : "",
+              images: Array.isArray(entry.images)
+                ? entry.images.filter((image) =>
+                  image
+                  && typeof image.data === "string"
+                  && /^data:image\/(?:png|jpeg|webp|gif);base64,/i.test(image.data)
+                ).map((image) => ({
+                  name: typeof image.name === "string" ? image.name : "Attached image",
+                  media_type: typeof image.media_type === "string" ? image.media_type : "image/png",
+                  data: image.data
+                }))
+                : [],
+              sources: Array.isArray(entry.sources)
+                ? entry.sources.filter((source) =>
+                  source
+                  && typeof source.uri === "string"
+                  && /^https?:\/\//i.test(source.uri)
+                )
+                : [],
+              web_search_queries: Array.isArray(entry.web_search_queries)
+                ? entry.web_search_queries.filter((query) => typeof query === "string")
+                : []
+            }));
+          if (!chatHistory.length) return;
+          elements.log.replaceChildren();
+          for (const entry of chatHistory) {
+            appendMessage(
+              entry.role,
+              entry.text,
+              typeof entry.kind === "string" ? entry.kind : "",
+              Array.isArray(entry.images) ? entry.images : [],
+              Array.isArray(entry.sources) ? entry.sources : [],
+              Array.isArray(entry.web_search_queries) ? entry.web_search_queries : [],
+              false
+            );
+          }
+        }
 
         function getSessionId() {
           try {
@@ -407,7 +495,15 @@
           });
         }
 
-        function appendMessage(role, text, kind = "", images = []) {
+        function appendMessage(
+          role,
+          text,
+          kind = "",
+          images = [],
+          sources = [],
+          webSearchQueries = [],
+          persist = true
+        ) {
           const wrapper = document.createElement("div");
           wrapper.className = role === "user" ? "flex justify-end gap-3" : "flex gap-3";
           const badge = document.createElement("span");
@@ -441,10 +537,49 @@
             }
             content.append(attachments);
           }
+          if (role === "assistant" && sources.length) {
+            const sourceList = document.createElement("div");
+            sourceList.className = "mt-3 border-t border-white/5 pt-2 text-xs";
+            const sourceHeading = document.createElement("p");
+            sourceHeading.className = "mb-1 text-[10px] uppercase tracking-wider text-slate-500";
+            sourceHeading.textContent = "Sources";
+            const links = document.createElement("div");
+            links.className = "flex flex-wrap gap-x-3 gap-y-1";
+            for (const source of sources.slice(0, 8)) {
+              if (!source || typeof source.uri !== "string") continue;
+              let url;
+              try {
+                url = new URL(source.uri);
+              } catch {
+                continue;
+              }
+              if (!["http:", "https:"].includes(url.protocol)) continue;
+              const link = document.createElement("a");
+              link.className = "text-cyan/80 underline decoration-cyan/20 underline-offset-2 hover:text-cyan";
+              link.href = url.href;
+              link.target = "_blank";
+              link.rel = "noopener noreferrer";
+              link.textContent = typeof source.title === "string" ? source.title : url.hostname;
+              links.append(link);
+            }
+            if (links.childElementCount) sourceList.append(sourceHeading, links);
+            if (links.childElementCount) content.append(sourceList);
+          }
           if (role === "user") wrapper.append(content, badge);
           else wrapper.append(badge, content);
           elements.log.append(wrapper);
           elements.log.scrollTop = elements.log.scrollHeight;
+          if (persist) {
+            chatHistory.push({
+              role,
+              text,
+              kind,
+              images,
+              sources,
+              web_search_queries: webSearchQueries
+            });
+            saveChatHistory();
+          }
         }
 
         async function apiRequest(path, options = {}) {
@@ -495,6 +630,7 @@
         }
 
         elements.sessionDisplay.textContent = sessionId.slice(0, 8);
+        restoreChatHistory();
 
         async function sendMessage(message) {
           const images = selectedImages.map(({ name, media_type, data }) => ({
@@ -520,7 +656,14 @@
               })
             });
             setDeveloperMode(Boolean(result.developer_mode_active));
-            appendMessage("assistant", result.reply, result.auth_required ? "AUTH REQUIRED" : "");
+            appendMessage(
+              "assistant",
+              result.reply,
+              result.auth_required ? "AUTH REQUIRED" : "",
+              [],
+              result.sources || [],
+              result.web_search_queries || []
+            );
             if (result.auth_required) openAuthModal();
           } catch (error) {
             appendMessage("assistant", error.message || "The request failed. Please try again.", "CONNECTION ERROR");
@@ -545,6 +688,20 @@
         });
 
         elements.imageButton.addEventListener("click", () => elements.imageInput.click());
+        elements.clearChat.addEventListener("click", () => {
+          chatHistory = [];
+          try {
+            localStorage.removeItem(`${CHAT_HISTORY_STORAGE_KEY}:${sessionId}`);
+          } catch (error) {
+            console.error("Could not clear chat history from localStorage.", error);
+            setHistoryNotice("History could not be cleared");
+            return;
+          }
+          elements.log.replaceChildren(welcomeMessage.cloneNode(true));
+          elements.systemLabel.textContent = "Memory cleared";
+          elements.systemDot.classList.remove("bg-rose-400", "bg-cyan");
+          elements.systemDot.classList.add("bg-emerald-400");
+        });
         elements.imageInput.addEventListener("change", async () => {
           const files = Array.from(elements.imageInput.files || []);
           elements.imageInput.value = "";
@@ -598,7 +755,15 @@
             developerCode = code;
             setDeveloperMode(Boolean(result.developer_mode_active));
             closeAuthModal();
-            appendMessage("assistant", "Developer authorization verified for this page session.");
+            appendMessage(
+              "assistant",
+              "Developer authorization verified for this page session.",
+              "SYSTEM",
+              [],
+              [],
+              [],
+              false
+            );
             if (pendingMessage) {
               const message = pendingMessage;
               pendingMessage = null;

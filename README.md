@@ -6,7 +6,7 @@ Configure these environment variables in the deployment environment (and in a
 local `.env` file when running locally):
 
 - `GEMINI_API_KEY` — Google AI Studio API key. Gemini requests use the
-  production `gemini-2.5-flash` model and retry with `gemini-2.5-flash-lite`
+  production `gemini-2.5-flash` model and retry with `gemini-3.5-flash-lite`
   if the API reports that the primary model is unavailable.
 - `NEON_DATABASE_URL` — optional for chat; required for persistent chat
   history, developer sessions, and agent task state.
